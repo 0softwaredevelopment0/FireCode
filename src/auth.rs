@@ -1,0 +1,182 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use rusqlite::Connection;
+
+use crate::config::{TOKEN_KIND_COOKIE, TOKEN_KIND_LOCAL_STORAGE, TokenSourceConfig};
+
+pub const MASKED_PREFIX: usize = 8;
+pub const MASKED_SUFFIX: usize = 4;
+
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub key: String,
+    pub value: String,
+}
+
+impl Token {
+    pub fn masked(&self) -> String {
+        mask(&self.value)
+    }
+}
+
+pub fn mask(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= MASKED_PREFIX + MASKED_SUFFIX {
+        return "*".repeat(chars.len().max(3));
+    }
+    let head: String = chars[..MASKED_PREFIX].iter().collect();
+    let tail: String = chars[chars.len() - MASKED_SUFFIX..].iter().collect();
+    format!("{head}\u{2026}{tail} ({} chars)", chars.len())
+}
+
+pub fn read_token(profile_dir: &Path, source: &TokenSourceConfig) -> Result<Token> {
+    match source.kind.as_str() {
+        TOKEN_KIND_LOCAL_STORAGE => {
+            let keys = source
+                .keys
+                .first()
+                .ok_or_else(|| anyhow!("token.keys is empty for localStorage source"))?;
+            read_local_storage_token(profile_dir, &source.db_path, keys)
+        }
+        TOKEN_KIND_COOKIE => bail!("cookie token source is not implemented yet"),
+        other => bail!("unknown token source kind: '{other}'"),
+    }
+}
+
+fn read_local_storage_token(profile_dir: &Path, db_rel: &str, key: &str) -> Result<Token> {
+    if db_rel.is_empty() {
+        bail!("token.db_path is empty for localStorage source");
+    }
+    let db_path = profile_dir.join(db_rel);
+    if !db_path.is_file() {
+        bail!(
+            "localStorage database not found: {}",
+            db_path.display()
+        );
+    }
+
+    let temp_dir = snapshot_db(&db_path).context("failed to snapshot localStorage database")?;
+    let snapshot = temp_dir.join("data.sqlite");
+
+    let result = (|| -> Result<Token> {
+        let conn =
+            Connection::open_with_flags(&snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("failed to open snapshot {}", snapshot.display()))?;
+
+        let (raw, utf16_length, conversion_type, compression_type): (Vec<u8>, i64, i64, i64) = conn
+            .query_row(
+                "SELECT value, utf16_length, conversion_type, compression_type \
+                 FROM data WHERE key = ?1",
+                [key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    anyhow!("key '{key}' not found in localStorage database")
+                }
+                other => anyhow!("failed to query key '{key}': {other}"),
+            })?;
+
+        if compression_type != 0 {
+            bail!(
+                "value of '{key}' is LZ4-compressed (compression_type={compression_type}), \
+                 which is not supported yet"
+            );
+        }
+
+        let value = match conversion_type {
+            1 => raw.iter().map(|&b| b as char).collect::<String>(),
+            0 => {
+                let units: Vec<u16> = raw
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+                String::from_utf16(&units)
+                    .map_err(|e| anyhow!("invalid UTF-16 value for '{key}': {e}"))?
+            }
+            other => bail!("unknown conversion_type={other} for key '{key}'"),
+        };
+
+        let _ = utf16_length;
+        if value.trim().is_empty() {
+            bail!("value of '{key}' is empty");
+        }
+        Ok(Token {
+            key: key.to_owned(),
+            value: value.trim().to_owned(),
+        })
+    })();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+/// Copies the SQLite database (plus -wal/-shm sidecars) into a temporary
+/// directory so we can read it even while Firefox holds a lock on the original.
+fn snapshot_db(db_path: &Path) -> Result<PathBuf> {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "firecode_auth_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("failed to create {}", temp_dir.display()))?;
+
+    fs::copy(db_path, temp_dir.join("data.sqlite"))
+        .with_context(|| format!("failed to copy {}", db_path.display()))?;
+    for sidecar in ["-wal", "-shm"] {
+        let src = PathBuf::from(format!("{}{sidecar}", db_path.display()));
+        if src.is_file() {
+            let _ = fs::copy(&src, temp_dir.join(format!("data.sqlite{sidecar}")));
+        }
+    }
+    Ok(temp_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_hides_middle_of_long_tokens() {
+        let masked = mask("abcdefghij1234567890");
+        assert!(masked.starts_with("abcdefgh\u{2026}"));
+        assert!(masked.ends_with("7890 (20 chars)"));
+        assert!(!masked.contains("ij1234"));
+    }
+
+    #[test]
+    fn mask_short_values_fully() {
+        assert_eq!(mask("abc"), "***");
+    }
+
+    #[test]
+    fn latin1_decoding_matches_ascii() {
+        let bytes: Vec<u8> = "eyJhbGciOiJIUzQ".as_bytes().to_vec();
+        let decoded: String = bytes.iter().map(|&b| b as char).collect();
+        assert_eq!(decoded, "eyJhbGciOiJIUzQ");
+    }
+
+    /// Verification against the real Firefox profile on this machine.
+    /// Run explicitly: cargo test --release -- --ignored
+    #[test]
+    #[ignore = "requires the real Firefox profile on the dev machine"]
+    fn real_profile_token_is_readable() {
+        let (config, path) = crate::config::load_or_create().expect("config load failed");
+        println!("config: {}", path.display());
+        let profile = config.profile.path.clone();
+        let site = config.site(&config.default_site).expect("default site");
+        let token = read_token(Path::new(&profile), &site.token).expect("token read failed");
+        println!("site '{}', key '{}': {}", config.default_site, token.key, token.masked());
+        assert!(token.value.len() > 20);
+    }
+}
