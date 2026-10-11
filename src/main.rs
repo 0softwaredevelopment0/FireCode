@@ -588,6 +588,19 @@ fn markdown_blocks_ui(
 fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) {
     let expanded = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(id, false));
 
+    // multiline feedback headers (multiline commands span lines inside
+    // `Command "...":`) must not leak into the single-line header row -
+    // show the first line with an ellipsis
+    let header_line: String = {
+        let mut lines = header.lines();
+        let first = lines.next().unwrap_or("").to_owned();
+        if lines.next().is_some() {
+            format!("{first} …")
+        } else {
+            first
+        }
+    };
+
     let mono_size = egui::TextStyle::Monospace.resolve(ui.style()).size;
     let row_h = ui.fonts_mut(|fonts| {
         fonts
@@ -643,7 +656,7 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
             ui.put(
                 rect.shrink2(egui::vec2(8.0, 0.0)),
                 egui::Label::new(
-                    egui::RichText::new(format!("{tri} {header}"))
+                    egui::RichText::new(format!("{tri} {header_line}"))
                         .monospace()
                         .color(egui::Color32::from_rgb(225, 225, 230)),
                 )
@@ -660,6 +673,7 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
                         } else {
                             egui::ScrollArea::vertical()
                                 .id_salt(id.with("scroll"))
+                                .auto_shrink([false, true])
                                 .max_height(row_h * 10.0)
                                 .show(ui, |ui| {
                                     ui.monospace(body);
