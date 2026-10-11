@@ -580,11 +580,11 @@ fn markdown_blocks_ui(
     }
 }
 
-/// Command execution output: full-width window (always stretched to the
-/// right edge, adaptive on resize) with a clickable header button. Collapsed
-/// by default to a 10-row scrollable preview (mouse wheel or scrollbar);
-/// clicking the header toggles the full output. An empty body renders the
-/// header button only (no frame).
+/// Command execution output: ONE window - a single dark frame containing
+/// the clickable header row (triangle + command, dark fill, lighter on
+/// hover) and the body below it. Collapsed by default to a 10-row
+/// scrollable preview (mouse wheel or scrollbar); clicking the header row
+/// toggles the full output. An empty body renders the header row only.
 fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) {
     let expanded = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(id, false));
 
@@ -601,46 +601,73 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
             .y
     });
 
-    // full-width clickable header button: triangle + command text
-    let tri = if expanded { "▾" } else { "▸" };
-    let response = ui.add(
-        egui::Button::new(
-            egui::RichText::new(format!("{tri} {header}"))
-                .monospace()
-                .color(egui::Color32::from_rgb(225, 225, 230)),
-        )
-        .min_size(egui::vec2(
-            ui.available_width(),
-            ui.style().spacing.interact_size.y.max(row_h * 1.3),
-        )),
-    );
-    if response.clicked() {
-        ui.memory_mut(|mem| {
-            let flag = mem.data.get_temp_mut_or(id, false);
-            *flag = !*flag;
-        });
-    }
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(30, 30, 34))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 76)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::same(0))
+        .show(ui, |ui| {
+            ui.allocate_space(egui::vec2(ui.available_width(), 0.0));
 
-    if !body.is_empty() {
-        egui::Frame::default()
-            .fill(egui::Color32::from_rgb(30, 30, 34))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 76)))
-            .corner_radius(6)
-            .inner_margin(egui::Margin::same(8))
-            .show(ui, |ui| {
-                ui.allocate_space(egui::vec2(ui.available_width(), 0.0));
-                if expanded {
-                    ui.monospace(body);
+            // header row: click target + background fill, text as a real
+            // widget (painter text is what caused the frozen-copy artifact)
+            let header_h = ui
+                .style()
+                .spacing
+                .interact_size
+                .y
+                .max(row_h * 1.4);
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), header_h),
+                egui::Sense::click(),
+            );
+            if response.clicked() {
+                ui.memory_mut(|mem| {
+                    let flag = mem.data.get_temp_mut_or(id, false);
+                    *flag = !*flag;
+                });
+            }
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            ui.painter().rect_filled(
+                rect,
+                0,
+                if response.hovered() {
+                    egui::Color32::from_rgb(48, 48, 55)
                 } else {
-                    egui::ScrollArea::vertical()
-                        .id_salt(id.with("scroll"))
-                        .max_height(row_h * 10.0)
-                        .show(ui, |ui| {
+                    egui::Color32::from_rgb(38, 38, 44)
+                },
+            );
+            let tri = if expanded { "▾" } else { "▸" };
+            ui.put(
+                rect.shrink2(egui::vec2(8.0, 0.0)),
+                egui::Label::new(
+                    egui::RichText::new(format!("{tri} {header}"))
+                        .monospace()
+                        .color(egui::Color32::from_rgb(225, 225, 230)),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend),
+            );
+
+            if !body.is_empty() {
+                ui.separator();
+                egui::Frame::default()
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        if expanded {
                             ui.monospace(body);
-                        });
-                }
-            });
-    }
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .id_salt(id.with("scroll"))
+                                .max_height(row_h * 10.0)
+                                .show(ui, |ui| {
+                                    ui.monospace(body);
+                                });
+                        }
+                    });
+            }
+        });
     ui.add_space(2.0);
 }
 
@@ -1487,15 +1514,19 @@ impl eframe::App for FireCodeApp {
                                     );
                                 }
                                 "command" => {
-                                    // plain command line only; the single
-                                    // output window is the feedback message
-                                    // that follows - no second window here
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.weak(
-                                            egui::RichText::new(&message.text)
-                                                .monospace(),
-                                        );
-                                    });
+                                    // live indicator only: while the command
+                                    // runs show the dim `$ cmd ...running`
+                                    // line; when finished the feedback window
+                                    // header already carries the command, so
+                                    // rendering it again would duplicate it
+                                    if message.text.contains("...running") {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.weak(
+                                                egui::RichText::new(&message.text)
+                                                    .monospace(),
+                                            );
+                                        });
+                                    }
                                 }
                                 "feedback" => {
                                     ui.strong("⚙ Feedback:");
