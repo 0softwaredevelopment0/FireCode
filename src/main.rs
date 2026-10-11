@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod auth;
 mod config;
@@ -15,27 +15,40 @@ enum TokenStatus {
     Pending,
 }
 
-#[derive(Debug)]
+enum WorkerCommand {
+    Prompt {
+        session_id: Option<String>,
+        parent_message_id: Option<i64>,
+        text: String,
+        model_class: String,
+        thinking_enabled: bool,
+    },
+    LoadHistory {
+        session_id: String,
+    },
+    RefreshSessions,
+}
+
 enum ChatEvent {
     Delta { text: String },
-    Finished { result: Result<(), String> },
+    Finished {
+        result: Result<(), String>,
+        last_message_id: Option<i64>,
+    },
+    SessionCreated { id: String },
+    TitleSet { session_id: String, title: String },
+    HistoryLoaded {
+        session_id: String,
+        messages: Vec<(&'static str, String)>,
+        last_message_id: Option<i64>,
+    },
+    SessionsLoaded {
+        result: Result<Vec<deepseek::SessionInfo>, String>,
+    },
 }
 
-struct FireCodeApp {
-    config: config::Config,
-    config_path: std::path::PathBuf,
-    tokens: BTreeMap<String, TokenStatus>,
-    default_token: Option<String>,
-    messages: Vec<(&'static str, String)>,
-    input: String,
-    streaming_text: Option<String>,
-    busy: bool,
-    event_rx: Receiver<ChatEvent>,
-    prompt_tx: Option<Sender<String>>,
-}
-
-fn spawn_worker(base_url: String, token: String) -> (Sender<String>, Receiver<ChatEvent>) {
-    let (prompt_tx, prompt_rx) = std::sync::mpsc::channel::<String>();
+fn spawn_worker(base_url: String, token: String) -> (Sender<WorkerCommand>, Receiver<ChatEvent>) {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WorkerCommand>();
     let (event_tx, event_rx) = std::sync::mpsc::channel::<ChatEvent>();
 
     std::thread::spawn(move || {
@@ -44,6 +57,7 @@ fn spawn_worker(base_url: String, token: String) -> (Sender<String>, Receiver<Ch
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Finished {
                     result: Err(format!("tokio runtime: {e}")),
+                    last_message_id: None,
                 });
                 return;
             }
@@ -54,64 +68,136 @@ fn spawn_worker(base_url: String, token: String) -> (Sender<String>, Receiver<Ch
                 Err(e) => {
                     let _ = event_tx.send(ChatEvent::Finished {
                         result: Err(format!("{e:#}")),
+                        last_message_id: None,
                     });
                     return;
                 }
             };
-            let mut session: Option<String> = None;
-            let mut parent_message_id: Option<i64> = None;
 
-            while let Ok(prompt) = prompt_rx.recv() {
-                if session.is_none() {
-                    match client.create_session().await {
-                        Ok(id) => session = Some(id),
-                        Err(e) => {
-                            let _ = event_tx.send(ChatEvent::Finished {
-                                result: Err(format!("create session: {e:#}")),
-                            });
-                            continue;
-                        }
+            while let Ok(cmd) = cmd_rx.recv() {
+                match cmd {
+                    WorkerCommand::Prompt {
+                        session_id,
+                        parent_message_id,
+                        text,
+                        model_class,
+                        thinking_enabled,
+                    } => {
+                        let sid = match session_id {
+                            Some(sid) => sid,
+                            None => match client.create_session().await {
+                                Ok(id) => {
+                                    let _ =
+                                        event_tx.send(ChatEvent::SessionCreated { id: id.clone() });
+                                    id
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(ChatEvent::Finished {
+                                        result: Err(format!("create session: {e:#}")),
+                                        last_message_id: None,
+                                    });
+                                    continue;
+                                }
+                            },
+                        };
+                        let result = try_prompt(
+                            &client,
+                            &sid,
+                            &text,
+                            parent_message_id,
+                            &model_class,
+                            thinking_enabled,
+                            &event_tx,
+                        )
+                        .await;
+                        let _ = event_tx.send(ChatEvent::Finished {
+                            result: match &result {
+                                Ok(_) => Ok(()),
+                                Err(e) => Err(format!("{e:#}")),
+                            },
+                            last_message_id: result.ok().flatten(),
+                        });
+                    }
+                    WorkerCommand::LoadHistory { session_id } => {
+                        let event = match client.history(&session_id).await {
+                            Ok(messages) => {
+                                let last_message_id = messages
+                                    .iter()
+                                    .rev()
+                                    .find_map(|m| m.message_id);
+                                ChatEvent::HistoryLoaded {
+                                    session_id,
+                                    messages: messages
+                                        .into_iter()
+                                        .map(|m| {
+                                            let role: &'static str =
+                                                if m.role == "user" { "user" } else { "assistant" };
+                                            (role, m.text)
+                                        })
+                                        .collect(),
+                                    last_message_id,
+                                }
+                            }
+                            Err(e) => ChatEvent::Finished {
+                                result: Err(format!("history: {e:#}")),
+                                last_message_id: None,
+                            },
+                        };
+                        let _ = event_tx.send(event);
+                    }
+                    WorkerCommand::RefreshSessions => {
+                        let event = ChatEvent::SessionsLoaded {
+                            result: client
+                                .list_sessions(50)
+                                .await
+                                .map_err(|e| format!("{e:#}")),
+                        };
+                        let _ = event_tx.send(event);
                     }
                 }
-                let session_id = session.clone().expect("session checked above");
-                let result = try_prompt(
-                    &client,
-                    &session_id,
-                    &prompt,
-                    parent_message_id,
-                    &event_tx,
-                )
-                .await;
-                if let Ok(Some(id)) = &result {
-                    parent_message_id = Some(*id);
-                }
-                let _ = event_tx.send(ChatEvent::Finished {
-                    result: match &result {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(format!("{e:#}")),
-                    },
-                });
             }
         });
     });
 
-    (prompt_tx, event_rx)
+    (cmd_tx, event_rx)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_prompt(
     client: &deepseek::DeepSeekClient,
     session_id: &str,
     prompt: &str,
     parent_message_id: Option<i64>,
+    model_class: &str,
+    thinking_enabled: bool,
     event_tx: &Sender<ChatEvent>,
 ) -> Result<Option<i64>, anyhow::Error> {
     let resp = client
-        .completion(session_id, prompt, parent_message_id, false)
+        .completion(
+            session_id,
+            prompt,
+            parent_message_id,
+            model_class,
+            thinking_enabled,
+        )
         .await?;
     let mut acc = deepseek::ResponseAccumulator::default();
-    let last = deepseek::pump_sse(resp, |payload| {
+    let sid = session_id.to_owned();
+    let tx = event_tx.clone();
+    let last = deepseek::pump_sse(resp, |event, payload| {
+        if event == "title" {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                if let Some(title) = v.get("content").and_then(|c| c.as_str()) {
+                    let _ = tx.send(ChatEvent::TitleSet {
+                        session_id: sid.clone(),
+                        title: title.to_owned(),
+                    });
+                }
+            }
+            return;
+        }
         if acc.feed(payload) {
-            let _ = event_tx.send(ChatEvent::Delta {
+            let _ = tx.send(ChatEvent::Delta {
                 text: acc.text.clone(),
             });
         }
@@ -120,21 +206,60 @@ async fn try_prompt(
     Ok(last)
 }
 
+struct ActiveSession {
+    id: Option<String>,
+    title: String,
+    messages: Vec<(&'static str, String)>,
+    last_message_id: Option<i64>,
+}
+
+struct FireCodeApp {
+    config: config::Config,
+    config_path: std::path::PathBuf,
+    tokens: BTreeMap<String, TokenStatus>,
+    default_token: Option<String>,
+    sessions: Vec<deepseek::SessionInfo>,
+    active: ActiveSession,
+    busy: bool,
+    input: String,
+    streaming_text: Option<String>,
+    preset_ids: Vec<String>,
+    preset_selected: usize,
+    event_rx: Receiver<ChatEvent>,
+    cmd_tx: Option<Sender<WorkerCommand>>,
+}
+
 impl FireCodeApp {
     fn new(config: config::Config, config_path: std::path::PathBuf) -> Self {
+        let preset_ids: Vec<String> = config.presets.keys().cloned().collect();
+        let preset_selected = preset_ids
+            .iter()
+            .position(|id| *id == config.default_preset)
+            .unwrap_or(0);
         let mut app = Self {
             config,
             config_path,
             tokens: BTreeMap::new(),
             default_token: None,
-            messages: Vec::new(),
+            sessions: Vec::new(),
+            active: ActiveSession {
+                id: None,
+                title: "New chat".to_owned(),
+                messages: Vec::new(),
+                last_message_id: None,
+            },
+            busy: false,
             input: String::new(),
             streaming_text: None,
-            busy: false,
+            preset_ids,
+            preset_selected,
             event_rx: std::sync::mpsc::channel().1,
-            prompt_tx: None,
+            cmd_tx: None,
         };
         app.reread_tokens();
+        if app.cmd_tx.is_some() {
+            app.refresh_sessions();
+        }
         app
     }
 
@@ -155,41 +280,67 @@ impl FireCodeApp {
                     continue;
                 }
             };
-            match auth::read_token(std::path::Path::new(&self.config.profile.path), &site.token)
-            {
+            match auth::read_token(std::path::Path::new(&self.config.profile.path), &site.token) {
                 Ok(token) => {
                     if id == self.config.default_site {
                         self.default_token = Some(token.value.clone());
                     }
                     let masked = token.masked();
-                    self.tokens.insert(
-                        id,
-                        TokenStatus::Ok { key: token.key, masked },
-                    );
+                    self.tokens
+                        .insert(id, TokenStatus::Ok { key: token.key, masked });
                 }
                 Err(e) => {
-                    self.tokens.insert(
-                        id,
-                        TokenStatus::Failed {
-                            error: format!("{e:#}"),
-                        },
-                    );
+                    self.tokens
+                        .insert(id, TokenStatus::Failed { error: format!("{e:#}") });
                 }
             }
         }
 
         match (&self.default_token, self.config.site(&self.config.default_site)) {
             (Some(token), Ok(site)) => {
-                let (prompt_tx, event_rx) = spawn_worker(site.api_base.clone(), token.clone());
-                self.prompt_tx = Some(prompt_tx);
+                let (cmd_tx, event_rx) = spawn_worker(site.api_base.clone(), token.clone());
+                self.cmd_tx = Some(cmd_tx);
                 self.event_rx = event_rx;
             }
-            (None, _) => self.prompt_tx = None,
-            (_, Err(e)) => {
-                eprintln!("default site missing: {e}");
-                self.prompt_tx = None;
-            }
+            _ => self.cmd_tx = None,
         }
+    }
+
+    fn refresh_sessions(&mut self) {
+        if let Some(cmd_tx) = &self.cmd_tx {
+            let _ = cmd_tx.send(WorkerCommand::RefreshSessions);
+        }
+    }
+
+    fn open_session(&mut self, id: String, title: String) {
+        if self.busy {
+            return;
+        }
+        self.active = ActiveSession {
+            id: Some(id),
+            title,
+            messages: Vec::new(),
+            last_message_id: None,
+        };
+        if let Some(cmd_tx) = &self.cmd_tx {
+            self.busy = true;
+            let _ = cmd_tx.send(WorkerCommand::LoadHistory {
+                session_id: self.active.id.clone().expect("id set above"),
+            });
+        }
+    }
+
+    fn new_chat(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.active = ActiveSession {
+            id: None,
+            title: "New chat".to_owned(),
+            messages: Vec::new(),
+            last_message_id: None,
+        };
+        self.streaming_text = None;
     }
 
     fn send_message(&mut self) {
@@ -197,14 +348,35 @@ impl FireCodeApp {
         if text.is_empty() || self.busy {
             return;
         }
-        let Some(prompt_tx) = &self.prompt_tx else {
+        let Some(cmd_tx) = self.cmd_tx.clone() else {
             return;
         };
-        self.messages.push(("user", text.clone()));
+        let Some(preset) = self.config.preset(self.selected_preset_id()).ok() else {
+            return;
+        };
+        let preset = preset.clone();
+        self.messages_push(("user", text.clone()));
         self.input.clear();
         self.streaming_text = Some(String::new());
         self.busy = true;
-        let _ = prompt_tx.send(text);
+        let _ = cmd_tx.send(WorkerCommand::Prompt {
+            session_id: self.active.id.clone(),
+            parent_message_id: self.active.last_message_id,
+            text,
+            model_class: preset.model_class,
+            thinking_enabled: preset.thinking_enabled,
+        });
+    }
+
+    fn messages_push(&mut self, message: (&'static str, String)) {
+        self.active.messages.push(message);
+    }
+
+    fn selected_preset_id(&self) -> &str {
+        self.preset_ids
+            .get(self.preset_selected)
+            .map(String::as_str)
+            .unwrap_or(self.config.default_preset.as_str())
     }
 
     fn poll_events(&mut self, ctx: &egui::Context) {
@@ -215,19 +387,66 @@ impl FireCodeApp {
                 ChatEvent::Delta { text } => {
                     self.streaming_text = Some(text);
                 }
-                ChatEvent::Finished { result } => {
+                ChatEvent::Finished {
+                    result,
+                    last_message_id,
+                } => {
                     self.busy = false;
                     let text = self.streaming_text.take().unwrap_or_default();
                     match result {
-                        Ok(()) => self.messages.push(("assistant", text)),
+                        Ok(()) => {
+                            if let Some(id) = last_message_id {
+                                self.active.last_message_id = Some(id);
+                            }
+                            self.messages_push(("assistant", text));
+                        }
                         Err(e) => {
                             if !text.is_empty() {
-                                self.messages.push(("assistant", text));
+                                self.messages_push(("assistant", text));
                             }
-                            self.messages.push(("error", e));
+                            self.messages_push(("error", e));
                         }
                     }
                 }
+                ChatEvent::SessionCreated { id } => {
+                    self.active.id = Some(id.clone());
+                    let title = self
+                        .active
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|(role, _)| *role == "user")
+                        .map(|(_, text)| text.chars().take(40).collect::<String>())
+                        .unwrap_or_else(|| "New chat".to_owned());
+                    self.active.title = title.clone();
+                    self.sessions.insert(
+                        0,
+                        deepseek::SessionInfo { id, title },
+                    );
+                }
+                ChatEvent::TitleSet { session_id, title } => {
+                    if self.active.id.as_deref() == Some(session_id.as_str()) {
+                        self.active.title = title.clone();
+                    }
+                    if let Some(entry) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        entry.title = title;
+                    }
+                }
+                ChatEvent::HistoryLoaded {
+                    session_id,
+                    messages,
+                    last_message_id,
+                } => {
+                    self.busy = false;
+                    if self.active.id.as_deref() == Some(session_id.as_str()) {
+                        self.active.messages = messages;
+                        self.active.last_message_id = last_message_id;
+                    }
+                }
+                ChatEvent::SessionsLoaded { result } => match result {
+                    Ok(sessions) => self.sessions = sessions,
+                    Err(e) => self.messages_push(("error", format!("session list: {e}"))),
+                },
             }
         }
         if repaint {
@@ -246,7 +465,33 @@ impl eframe::App for FireCodeApp {
                 ui.heading("FireCode");
                 ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::CollapsingHeader::new("⚙ auth")
+                    let preset_names: Vec<String> = self
+                        .preset_ids
+                        .iter()
+                        .map(|id| {
+                            self.config
+                                .preset(id)
+                                .map(|p| p.display_name.clone())
+                                .unwrap_or_else(|_| id.clone())
+                        })
+                        .collect();
+                    egui::ComboBox::from_id_salt("preset_combo")
+                        .selected_text(
+                            preset_names
+                                .get(self.preset_selected)
+                                .map(String::as_str)
+                                .unwrap_or("preset"),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (i, name) in preset_names.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.preset_selected,
+                                    i,
+                                    name.clone(),
+                                );
+                            }
+                        });
+                    egui::CollapsingHeader::new("вљ™ auth")
                         .id_salt("auth_panel")
                         .show(ui, |ui| {
                             ui.monospace(self.config_path.display().to_string());
@@ -285,81 +530,138 @@ impl eframe::App for FireCodeApp {
             });
             ui.separator();
 
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
+            egui::Panel::left("sessions_panel")
+                .resizable(true)
+                .default_size(230.0)
                 .show(ui, |ui| {
-                    ui.add_space(4.0);
-                    if self.messages.is_empty() && !self.busy {
-                        ui.colored_label(
-                            egui::Color32::GRAY,
-                            "Chat with the default site. Messages go straight to the API.",
-                        );
-                    }
-                    for (role, text) in &self.messages {
-                        match *role {
-                            "user" => {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.strong("You:");
-                                    ui.label(text);
-                                });
-                            }
-                            "assistant" => {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.strong("AI:");
-                                    ui.label(text);
-                                });
-                            }
-                            _ => {
-                                ui.colored_label(egui::Color32::RED, format!("error: {text}"));
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!self.busy, egui::Button::new("+ New chat")).clicked() {
+                            self.new_chat();
+                        }
+                        if ui.add_enabled(!self.busy, egui::Button::new("вџі")).clicked() {
+                            self.refresh_sessions();
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let active_id = self.active.id.clone();
+                        let mut open_request: Option<(String, String)> = None;
+                        for session in &self.sessions {
+                            let is_active = active_id.as_deref() == Some(session.id.as_str());
+                            let label = if session.title.is_empty() {
+                                session.id.chars().take(12).collect::<String>()
+                            } else {
+                                session.title.clone()
+                            };
+                            let style = if is_active {
+                                egui::TextStyle::Body
+                            } else {
+                                egui::TextStyle::Small
+                            };
+                            let response = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(label)
+                                        .text_style(style)
+                                        .color(if is_active {
+                                            ui.visuals().text_color()
+                                        } else {
+                                            ui.visuals().weak_text_color()
+                                        }),
+                                )
+                                .truncate(),
+                            );
+                            if response.clicked() && !self.busy && open_request.is_none() {
+                                open_request = Some((session.id.clone(), session.title.clone()));
                             }
                         }
-                        ui.add_space(2.0);
-                    }
-                    if let Some(partial) = &self.streaming_text {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.strong("AI:");
-                            if partial.is_empty() {
-                                ui.spinner();
-                                ui.label("waiting for stream...");
-                            } else {
-                                ui.label(format!("{partial}\u{258c}"));
-                            }
-                        });
-                    }
-                    ui.add_space(8.0);
+                        if let Some((id, title)) = open_request {
+                            self.open_session(id, title);
+                        }
+                    });
                 });
 
-            ui.separator();
-            ui.horizontal(|ui| {
-                let input_width = (ui.available_width() - 90.0).max(120.0);
-                let response = ui.add_sized(
-                    [input_width, 22.0],
-                    egui::TextEdit::singleline(&mut self.input)
-                        .hint_text("Type a message... (Enter to send)")
-                        .id_salt("chat_input"),
-                );
-                let enter_pressed =
-                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let can_send = !self.busy
-                    && !self.input.trim().is_empty()
-                    && self.prompt_tx.is_some();
-                let send_clicked = ui
-                    .add_enabled(can_send, egui::Button::new("Send"))
-                    .clicked();
-                if (send_clicked || enter_pressed) && can_send {
-                    self.send_message();
-                    response.request_focus();
-                }
-                if self.busy {
-                    ui.spinner();
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(&self.active.title);
+                    if self.busy {
+                        ui.spinner();
+                    }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        if self.active.messages.is_empty() && !self.busy {
+                            ui.colored_label(
+                                egui::Color32::GRAY,
+                                "Select a chat on the left or start a new one.",
+                            );
+                        }
+                        for (role, text) in &self.active.messages {
+                            match *role {
+                                "user" => {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.strong("You:");
+                                        ui.label(text);
+                                    });
+                                }
+                                "assistant" => {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.strong("AI:");
+                                        ui.label(text);
+                                    });
+                                }
+                                _ => {
+                                    ui.colored_label(egui::Color32::RED, format!("error: {text}"));
+                                }
+                            }
+                            ui.add_space(2.0);
+                        }
+                        if let Some(partial) = &self.streaming_text {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong("AI:");
+                                if partial.is_empty() {
+                                    ui.spinner();
+                                    ui.label("waiting for stream...");
+                                } else {
+                                    ui.label(format!("{partial}\u{258c}"));
+                                }
+                            });
+                        }
+                        ui.add_space(8.0);
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let input_width = (ui.available_width() - 90.0).max(120.0);
+                    let response = ui.add_sized(
+                        [input_width, 22.0],
+                        egui::TextEdit::singleline(&mut self.input)
+                            .hint_text("Type a message... (Enter to send)")
+                            .id_salt("chat_input"),
+                    );
+                    let enter_pressed =
+                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let can_send = !self.busy
+                        && !self.input.trim().is_empty()
+                        && self.cmd_tx.is_some();
+                    let send_clicked = ui
+                        .add_enabled(can_send, egui::Button::new("Send"))
+                        .clicked();
+                    if (send_clicked || enter_pressed) && can_send {
+                        self.send_message();
+                        response.request_focus();
+                    }
+                });
+                if self.cmd_tx.is_none() {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "No valid token for the default site - chat is disabled.",
+                    );
                 }
             });
-            if self.prompt_tx.is_none() {
-                ui.colored_label(
-                    egui::Color32::RED,
-                    "No valid token for the default site - chat is disabled.",
-                );
-            }
         });
     }
 }

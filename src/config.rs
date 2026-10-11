@@ -16,6 +16,20 @@ pub struct Config {
     pub default_site: String,
     #[serde(default)]
     pub sites: BTreeMap<String, SiteConfig>,
+    #[serde(default = "default_presets")]
+    pub presets: BTreeMap<String, PresetConfig>,
+    #[serde(default = "default_preset_id")]
+    pub default_preset: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresetConfig {
+    pub display_name: String,
+    /// Site id from `sites` this preset talks to.
+    pub site: String,
+    /// Model selector sent with each prompt (e.g. deepseek_chat).
+    pub model_class: String,
+    pub thinking_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -49,6 +63,24 @@ fn default_site_id() -> String {
     "deepseek".to_owned()
 }
 
+fn default_preset_id() -> String {
+    "deepseek".to_owned()
+}
+
+fn default_presets() -> BTreeMap<String, PresetConfig> {
+    let mut presets = BTreeMap::new();
+    presets.insert(
+        default_preset_id(),
+        PresetConfig {
+            display_name: "DeepSeek (chat)".to_owned(),
+            site: default_site_id(),
+            model_class: "deepseek_chat".to_owned(),
+            thinking_enabled: false,
+        },
+    );
+    presets
+}
+
 impl Config {
     pub fn default_with_profile(profile_path: &str) -> Self {
         let mut sites = BTreeMap::new();
@@ -72,6 +104,8 @@ impl Config {
             },
             default_site: default_site_id(),
             sites,
+            presets: default_presets(),
+            default_preset: default_preset_id(),
         }
     }
 
@@ -79,6 +113,12 @@ impl Config {
         self.sites
             .get(id)
             .ok_or_else(|| anyhow!("site '{id}' not found in config"))
+    }
+
+    pub fn preset(&self, id: &str) -> Result<&PresetConfig> {
+        self.presets
+            .get(id)
+            .ok_or_else(|| anyhow!("preset '{id}' not found in config"))
     }
 }
 
