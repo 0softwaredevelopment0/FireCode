@@ -3,10 +3,13 @@
 mod auth;
 mod config;
 mod deepseek;
+mod markdown;
 mod pow;
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, Sender};
+
+use markdown::Segment;
 
 #[derive(Debug, Clone)]
 enum TokenStatus {
@@ -220,6 +223,56 @@ struct ActiveSession {
     search: bool,
 }
 
+fn code_block_ui(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    lang: &str,
+    code: &str,
+    closed: bool,
+    id: egui::Id,
+    copied: &mut Option<(egui::Id, std::time::Instant)>,
+) {
+    let is_copied = copied
+        .as_ref()
+        .is_some_and(|(cid, at)| *cid == id && at.elapsed().as_secs_f32() < 1.5);
+    let mut header = lang.to_owned();
+    if !closed {
+        if !header.is_empty() {
+            header.push(' ');
+        }
+        header.push('\u{258c}');
+    }
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(30, 30, 34))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 76)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let copy_label = if is_copied { "✓ Copied" } else { "📋 Copy" };
+                if ui.small_button(copy_label).clicked() {
+                    ctx.copy_text(code.to_owned());
+                    *copied = Some((id, std::time::Instant::now()));
+                }
+                if !header.is_empty() {
+                    ui.weak(header);
+                }
+            });
+            ui.add_space(2.0);
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(code.trim_end_matches('\n'))
+                            .monospace()
+                            .color(egui::Color32::from_rgb(220, 220, 225)),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            });
+        });
+    ui.add_space(2.0);
+}
+
 /// Remembered DeepThink/Search toggles per chat id (like the web app,
 /// they are per-chat settings). New chats start from the preset default.
 fn default_toggles(config: &config::Config) -> (bool, bool) {
@@ -241,6 +294,7 @@ struct FireCodeApp {
     busy: bool,
     input: String,
     streaming: Option<StreamingAnswer>,
+    copied_code: Option<(egui::Id, std::time::Instant)>,
     preset_ids: Vec<String>,
     preset_selected: usize,
     event_rx: Receiver<ChatEvent>,
@@ -276,6 +330,7 @@ impl FireCodeApp {
             busy: false,
             input: String::new(),
             streaming: None,
+            copied_code: None,
             preset_ids,
             preset_selected,
             event_rx: std::sync::mpsc::channel().1,
@@ -716,6 +771,12 @@ impl eframe::App for FireCodeApp {
                                 "Select a chat on the left or start a new one.",
                             );
                         }
+                        let ctx2 = ui.ctx().clone();
+                        if let Some((_, at)) = &self.copied_code {
+                            if at.elapsed().as_secs_f32() >= 1.5 {
+                                self.copied_code = None;
+                            }
+                        }
                         for (mi, message) in self.active.messages.iter().enumerate() {
                             match message.role {
                                 "user" => {
@@ -736,9 +797,26 @@ impl eframe::App for FireCodeApp {
                                                 });
                                             });
                                     }
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(&message.text);
-                                    });
+                                    for (si, segment) in
+                                        markdown::split_fenced(&message.text).iter().enumerate()
+                                    {
+                                        match segment {
+                                            Segment::Text(t) => {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.label(t.trim_end_matches('\n'));
+                                                });
+                                            }
+                                            Segment::Code { lang, code, closed } => code_block_ui(
+                                                ui,
+                                                &ctx2,
+                                                lang,
+                                                code,
+                                                *closed,
+                                                egui::Id::new(("codeblock", mi, si)),
+                                                &mut self.copied_code,
+                                            ),
+                                        }
+                                    }
                                 }
                                 _ => {
                                     ui.colored_label(
@@ -756,14 +834,32 @@ impl eframe::App for FireCodeApp {
                                     ui.weak(format!("🧠 {thinking}\u{258c}"));
                                 });
                             }
-                            ui.horizontal_wrapped(|ui| {
-                                if streaming.text.is_empty() && streaming.thinking.is_none() {
+                            for (si, segment) in
+                                markdown::split_fenced(&streaming.text).iter().enumerate()
+                            {
+                                match segment {
+                                    Segment::Text(t) => {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(t.trim_end_matches('\n'));
+                                        });
+                                    }
+                                    Segment::Code { lang, code, closed } => code_block_ui(
+                                        ui,
+                                        &ctx2,
+                                        lang,
+                                        code,
+                                        *closed,
+                                        egui::Id::new(("streamcode", si)),
+                                        &mut self.copied_code,
+                                    ),
+                                }
+                            }
+                            if streaming.text.is_empty() && streaming.thinking.is_none() {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.spinner();
                                     ui.label("waiting for stream...");
-                                } else {
-                                    ui.label(format!("{}\u{258c}", streaming.text));
-                                }
-                            });
+                                });
+                            }
                         }
                         ui.add_space(8.0);
                     });
