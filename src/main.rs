@@ -2,6 +2,7 @@
 
 mod agent;
 mod auth;
+mod chatcache;
 mod chromium;
 mod config;
 mod deepseek;
@@ -43,6 +44,13 @@ struct ChatMessage {
     role: &'static str,
     thinking: Option<String>,
     text: String,
+}
+
+/// Turns an owned String into a `&'static str` for [`ChatMessage::role`]:
+/// the leak is a few bytes per restored message and keeps every
+/// construction site literal ("user", "assistant", ...). Deliberate.
+fn leak_static(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
 }
 
 #[derive(Default, Clone)]
@@ -901,7 +909,7 @@ impl FireCodeApp {
             .copied()
             .unwrap_or_else(|| default_toggles(&self.config));
         self.active = ActiveSession {
-            id: Some(id),
+            id: Some(id.clone()),
             title,
             messages: Vec::new(),
             last_message_id: None,
@@ -909,6 +917,23 @@ impl FireCodeApp {
             search,
             code,
         };
+        // local cache first: it holds the local-only command/feedback
+        // windows the server history does not know about; a stuck
+        // "...running" command line (app closed mid-run) is dropped
+        if let Some(cached) = chatcache::load(&id) {
+            self.active.messages = cached
+                .messages
+                .into_iter()
+                .filter(|m| !(m.role == "command" && m.text.contains("...running")))
+                .map(|m| ChatMessage {
+                    role: leak_static(m.role),
+                    thinking: m.thinking,
+                    text: m.text,
+                })
+                .collect();
+            self.active.last_message_id = cached.last_message_id;
+            return;
+        }
         if let Some(cmd_tx) = self.cmd_tx.clone() {
             self.busy = true;
             let _ = cmd_tx.send(WorkerCommand::LoadHistory {
@@ -1021,6 +1046,31 @@ impl FireCodeApp {
 
     fn messages_push(&mut self, message: ChatMessage) {
         self.active.messages.push(message);
+        self.persist_active();
+    }
+
+    /// Writes the active session's messages to the local cache so a
+    /// reopened chat (also after an app restart) shows the same
+    /// command/feedback windows. No-op for chats without an id yet.
+    fn persist_active(&self) {
+        if let Some(id) = &self.active.id {
+            chatcache::save(
+                id,
+                &chatcache::CachedChat {
+                    messages: self
+                        .active
+                        .messages
+                        .iter()
+                        .map(|m| chatcache::CachedMessage {
+                            role: m.role.to_owned(),
+                            thinking: m.thinking.clone(),
+                            text: m.text.clone(),
+                        })
+                        .collect(),
+                    last_message_id: self.active.last_message_id,
+                },
+            );
+        }
     }
 
     fn selected_preset_id(&self) -> &str {
@@ -1112,6 +1162,7 @@ impl FireCodeApp {
                         if let Some(msg) = self.active.messages.get_mut(idx) {
                             msg.text = text;
                             self.running_command_index = None;
+                            self.persist_active();
                             continue;
                         }
                     }
@@ -1140,7 +1191,10 @@ impl FireCodeApp {
                         .unwrap_or_else(|| "New chat".to_owned());
                     self.active.title = title.clone();
                     self.sessions
-                        .insert(0, deepseek::SessionInfo { id, title });
+                        .insert(0, deepseek::SessionInfo { id: id.clone(), title });
+                    // the chat just got its id - messages pushed before it
+                    // (the user prompt) are not cached yet
+                    self.persist_active();
                 }
                 ChatEvent::TitleSet { session_id, title } => {
                     if self.active.id.as_deref() == Some(session_id.as_str()) {
@@ -1159,6 +1213,9 @@ impl FireCodeApp {
                     if self.active.id.as_deref() == Some(session_id.as_str()) {
                         self.active.messages = messages;
                         self.active.last_message_id = last_message_id;
+                        // seed the local cache from the server history so
+                        // this chat is served locally from now on
+                        self.persist_active();
                     }
                 }
                 ChatEvent::SessionsLoaded { result } => match result {
