@@ -157,22 +157,53 @@ fn extract_string_line(trimmed: &str) -> Option<String> {
 }
 
 /// Splits a feedback message (built by [`build_feedback`]) back into
-/// `(header, output)` blocks: a line like `Command "cmd":` opens a block,
-/// everything until the next such line (or EOF) is its output. Lines before
-/// the first header are dropped (build_feedback emits none).
+/// `(header, output)` blocks. A header starts on a line beginning with
+/// `Command "` and ends on a line ending with `":` - it may span several
+/// lines when the command itself is multiline. Everything until the next
+/// header (or EOF) is that block's output. Lines before the first header
+/// are dropped (build_feedback emits none).
 pub fn parse_feedback_blocks(text: &str) -> Vec<(String, String)> {
     let mut blocks: Vec<(String, String)> = Vec::new();
     let mut current: Option<(String, String)> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(header) = trimmed
-            .strip_prefix("Command \"")
-            .and_then(|rest| rest.strip_suffix("\":"))
-        {
+    let mut header_buf: Option<String> = None;
+
+    let close_header = |header_buf: &mut Option<String>,
+                            current: &mut Option<(String, String)>,
+                            blocks: &mut Vec<(String, String)>| {
+        if let Some(full) = header_buf.take() {
+            let cmd = full
+                .trim()
+                .strip_prefix("Command \"")
+                .and_then(|rest| rest.strip_suffix("\":"))
+                .unwrap_or("")
+                .to_owned();
             if let Some(block) = current.take() {
                 blocks.push(block);
             }
-            current = Some((format!("Command \"{header}\":"), String::new()));
+            *current = Some((format!("Command \"{cmd}\":"), String::new()));
+        }
+    };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if header_buf.is_some() {
+            let buf = header_buf.as_mut().expect("header open");
+            buf.push('\n');
+            buf.push_str(line);
+            if trimmed.ends_with("\":") {
+                close_header(&mut header_buf, &mut current, &mut blocks);
+            }
+            continue;
+        }
+        if trimmed.starts_with("Command \"") {
+            if trimmed.ends_with("\":") {
+                if let Some(block) = current.take() {
+                    blocks.push(block);
+                }
+                current = Some((trimmed.to_owned(), String::new()));
+            } else {
+                header_buf = Some(line.to_owned());
+            }
             continue;
         }
         if let Some((_, body)) = current.as_mut() {
@@ -180,6 +211,15 @@ pub fn parse_feedback_blocks(text: &str) -> Vec<(String, String)> {
                 body.push('\n');
             }
             body.push_str(line);
+        }
+    }
+    // an unterminated multiline header falls back into the running block
+    if let Some(buf) = header_buf.take() {
+        if let Some((_, body)) = current.as_mut() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&buf);
         }
     }
     if let Some(block) = current.take() {
@@ -576,6 +616,18 @@ mod tests {
         let parsed = parse_response("<command:no-quotes>\n<command:\"\">");
         assert!(parsed.commands.is_empty());
         assert!(parsed.text.contains("<command:no-quotes>"));
+    }
+
+    #[test]
+    fn feedback_blocks_multiline_command_header() {
+        let feedback = "Command \"Write-Host '==='\n$a = 0\n$a = $b\":\nline1\nline2";
+        let blocks = parse_feedback_blocks(feedback);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].0,
+            "Command \"Write-Host '==='\n$a = 0\n$a = $b\":"
+        );
+        assert_eq!(blocks[0].1, "line1\nline2");
     }
 
     #[test]

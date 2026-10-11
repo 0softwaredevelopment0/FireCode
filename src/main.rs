@@ -584,24 +584,21 @@ fn markdown_blocks_ui(
 }
 
 /// Command execution output: full-width window (always stretched to the
-/// right edge, adaptive on resize), 20 text rows tall with its own
-/// scrollbar, expandable to the full output via the chevron.
-/// Keeps long outputs from flooding the chat.
+/// right edge, adaptive on resize) showing the whole output with no inner
+/// scrolling. The chevron collapses it to 10 rows for giant outputs.
 fn command_output_ui(ui: &mut egui::Ui, header: &str, body: &str) {
     let state_id = egui::Id::new(("cmdexpand", header));
-    let expanded = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(state_id, false));
+    let collapsed = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(state_id, false));
 
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+        let label = if collapsed { "▼ more" } else { "▲ less" };
+        if ui.small_button(label).clicked() {
+            ui.memory_mut(|mem| {
+                let flag = mem.data.get_temp_mut_or(state_id, false);
+                *flag = !*flag;
+            });
+        }
         ui.monospace(header);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let label = if expanded { "▲ less" } else { "▼ more" };
-            if ui.small_button(label).clicked() {
-                ui.memory_mut(|mem| {
-                    let flag = mem.data.get_temp_mut_or(state_id, false);
-                    *flag = !*flag;
-                });
-            }
-        });
     });
     let mono_size = egui::TextStyle::Monospace.resolve(ui.style()).size;
     let row_h = ui.fonts_mut(|fonts| {
@@ -622,15 +619,16 @@ fn command_output_ui(ui: &mut egui::Ui, header: &str, body: &str) {
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.allocate_space(egui::vec2(ui.available_width(), 0.0));
-            let area = egui::ScrollArea::vertical().id_salt(("cmdscroll", header));
-            let area = if expanded {
-                area
+            if collapsed {
+                egui::ScrollArea::vertical()
+                    .id_salt(("cmdscroll", header))
+                    .max_height(row_h * 10.0)
+                    .show(ui, |ui| {
+                        ui.monospace(body);
+                    });
             } else {
-                area.max_height(row_h * 20.0)
-            };
-            area.show(ui, |ui| {
                 ui.monospace(body);
-            });
+            }
         });
     ui.add_space(2.0);
 }
