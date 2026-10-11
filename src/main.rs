@@ -1176,21 +1176,39 @@ impl eframe::App for FireCodeApp {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     let input_width = (ui.available_width() - 90.0).max(120.0);
+                    let font_id = egui::TextStyle::Body.resolve(ui.style()).clone();
+                    let text_color = ui.visuals().text_color();
+                    let input_text = self.input.clone();
+                    let rows = ui
+                        .fonts_mut(|fonts| {
+                            fonts
+                                .layout_job(egui::text::LayoutJob::simple(
+                                    input_text,
+                                    font_id,
+                                    text_color,
+                                    input_width,
+                                ))
+                                .rows
+                                .len()
+                        })
+                        .clamp(1, 6);
                     let response = ui.add_sized(
-                        [input_width, 22.0],
-                        egui::TextEdit::singleline(&mut self.input)
-                            .hint_text("Type a message... (Enter to send)")
+                        [input_width, 22.0 * rows as f32],
+                        egui::TextEdit::multiline(&mut self.input)
+                            .desired_rows(rows)
+                            .desired_width(input_width)
+                            .hint_text("Type a message... (Ctrl+Enter to send)")
                             .id_salt("chat_input"),
                     );
-                    let enter_pressed =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let send_hotkey = response.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl);
                     let can_send = !self.busy
                         && !self.input.trim().is_empty()
                         && self.cmd_tx.is_some();
                     let send_clicked = ui
                         .add_enabled(can_send, egui::Button::new("Send"))
                         .clicked();
-                    if (send_clicked || enter_pressed) && can_send {
+                    if (send_clicked || send_hotkey) && can_send {
                         self.send_message();
                         response.request_focus();
                     }

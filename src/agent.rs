@@ -14,15 +14,47 @@ pub struct ParsedResponse {
     pub continue_next: bool,
 }
 
-/// Extracts `<command:"...">` lines and a trailing `<continue>` marker from
-/// a response. Anything else stays in `text`.
+/// Extracts single-line `<command:"...">` commands, multiline
+/// `<command-header>` / `<string:"...">` / `<command-footer>` blocks and a
+/// trailing `<continue>` marker from a response. Anything else stays in
+/// `text`. A multiline block runs as one command (lines joined with `\n`).
 pub fn parse_response(raw: &str) -> ParsedResponse {
     let mut text = String::new();
     let mut commands = Vec::new();
     let mut continue_next = false;
+    let mut multi: Option<Vec<String>> = None;
+
+    let flush_multi = |multi: &mut Option<Vec<String>>, commands: &mut Vec<String>| {
+        if let Some(block) = multi.take() {
+            let joined = block.join("\n");
+            if !joined.trim().is_empty() {
+                commands.push(joined);
+            }
+        }
+    };
 
     for line in raw.lines() {
         let trimmed = line.trim();
+        if multi.is_some() {
+            if trimmed == "<command-footer>" {
+                flush_multi(&mut multi, &mut commands);
+            } else if let Some(cmd) = trimmed
+                .strip_prefix("<string:\"")
+                .and_then(|rest| rest.strip_suffix("\">"))
+            {
+                if !cmd.trim().is_empty() {
+                    multi
+                        .as_mut()
+                        .expect("multiline block open")
+                        .push(cmd.trim().to_owned());
+                }
+            }
+            continue;
+        }
+        if trimmed == "<command-header>" {
+            multi = Some(Vec::new());
+            continue;
+        }
         if let Some(cmd) = trimmed
             .strip_prefix("<command:\"")
             .and_then(|rest| rest.strip_suffix("\">"))
@@ -39,6 +71,8 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
         text.push_str(line);
         text.push('\n');
     }
+    // an unterminated block still runs what was collected
+    flush_multi(&mut multi, &mut commands);
 
     ParsedResponse {
         text: text.trim_end().to_owned(),
@@ -246,6 +280,20 @@ Rules:
 - Keep the number of commands small and purposeful. Do not run destructive
   commands (deleting files, force pushes) unless the user explicitly asked.
 
+## Tool 1b: multiline commands
+
+When one command needs several lines, wrap them in a header/footer block.
+Every line inside must use the `<string:"...">` syntax:
+
+<command-header>
+<string:"cd project">
+<string:"cargo build --release">
+<string:"cargo test">
+<command-footer>
+
+The lines run together as one multiline command, top to bottom. The same
+rules as single-line commands apply (fresh shell, non-interactive, headless).
+
 ## Tool 2: continue
 
 Every user request is just an information output task, and one response may
@@ -270,8 +318,40 @@ pub fn ensure_prompt_md() -> Result<PathBuf> {
     if !path.exists() {
         std::fs::write(&path, DEFAULT_PROMPT_MD)
             .with_context(|| format!("failed to write {}", path.display()))?;
+        return Ok(path);
+    }
+    // existing file from an older version: append the multiline tool docs
+    // if the user has not added them (their own edits are kept as-is).
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if !raw.contains("<command-header>") {
+        let mut updated = raw;
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&multiline_tool_section());
+        std::fs::write(&path, updated)
+            .with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(path)
+}
+
+fn multiline_tool_section() -> &'static str {
+    r#"
+## Tool 1b: multiline commands
+
+When one command needs several lines, wrap them in a header/footer block.
+Every line inside must use the `<string:"...">` syntax:
+
+<command-header>
+<string:"cd project">
+<string:"cargo build --release">
+<string:"cargo test">
+<command-footer>
+
+The lines run together as one multiline command, top to bottom. The same
+rules as single-line commands apply (fresh shell, non-interactive, headless).
+"#
 }
 
 pub fn load_prompt_md() -> Result<String> {
@@ -368,6 +448,38 @@ mod tests {
         let feedback = build_feedback(&results);
         assert!(feedback.contains("Command \"echo\":\n(no output)"));
         assert!(feedback.contains("Command \"slow\":\n(no output)\n(did not exit)\n(timed out)"));
+    }
+
+    #[test]
+    fn parse_multiline_command_block() {
+        let raw = "делаю\n<command-header>\n<string:\"cd project\">\n<string:\"cargo build\">\n<string:\"cargo test\">\n<command-footer>\nготово";
+        let parsed = parse_response(raw);
+        assert_eq!(parsed.commands, vec!["cd project\ncargo build\ncargo test".to_owned()]);
+        assert!(!parsed.continue_next);
+        assert_eq!(parsed.text, "делаю\nготово");
+    }
+
+    #[test]
+    fn parse_multiline_mixed_with_single_and_continue() {
+        let raw = "<command:\"git status\">\n<command-header>\n<string:\"echo a\">\n<command-footer>\n<continue>";
+        let parsed = parse_response(raw);
+        assert_eq!(parsed.commands, vec!["git status".to_owned(), "echo a".to_owned()]);
+        assert!(parsed.continue_next);
+        assert!(parsed.text.is_empty());
+    }
+
+    #[test]
+    fn parse_unterminated_block_flushes() {
+        let parsed = parse_response("<command-header>\n<string:\"echo hi\">");
+        assert_eq!(parsed.commands, vec!["echo hi".to_owned()]);
+    }
+
+    #[test]
+    fn parse_block_skips_empty_and_foreign_lines() {
+        let raw = "<command-header>\n<string:\"\">\nмусор\n<string:\"echo ok\">\n<command-footer>";
+        let parsed = parse_response(raw);
+        assert_eq!(parsed.commands, vec!["echo ok".to_owned()]);
+        assert!(parsed.text.is_empty());
     }
 
     #[test]
