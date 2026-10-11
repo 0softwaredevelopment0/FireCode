@@ -1,9 +1,10 @@
 [package]
 name = "firecode"
-version = "0.1.0-alpha.11"
+version = "0.1.0-alpha.12"
 edition = "2024"
 
 [dependencies]
+aes-gcm = "0.11.1"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 directories = "6.0.0"
@@ -12,7 +13,9 @@ egui = "0.36.2"
 futures-util = "0.3.34"
 reqwest = { version = "0.13.5", features = ["json", "cookies", "stream", "gzip", "query"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusty-leveldb = "4.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time", "process"] }
 toml = "1.1.8"
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }

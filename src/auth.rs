@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::Connection;
 
+use crate::chromium::snapshot_file;
 use crate::config::{TOKEN_KIND_COOKIE, TOKEN_KIND_LOCAL_STORAGE, TokenSourceConfig};
 use crate::settings::BrowserPreset;
 
@@ -24,7 +25,7 @@ impl Token {
 
 /// Firefox localStorage values for chat.deepseek.com are JSON wrappers like
 /// `{"value": "..."}` (nested one more level in some keys) - unwrap them.
-fn unwrap_local_storage_value(value: String) -> String {
+pub(crate) fn unwrap_local_storage_value(value: String) -> String {
     let mut current = value;
     for _ in 0..2 {
         if !current.starts_with('{') {
@@ -64,21 +65,68 @@ pub fn read_token(
 ) -> Result<Token> {
     match source.kind.as_str() {
         TOKEN_KIND_LOCAL_STORAGE => {
-            if preset != BrowserPreset::Firefox {
-                bail!(
-                    "{} profiles keep tokens in LevelDB storage - reading is not implemented yet",
-                    preset.display_name()
-                );
-            }
-            let keys = source
+            let key = source
                 .keys
                 .first()
                 .ok_or_else(|| anyhow!("token.keys is empty for localStorage source"))?;
-            read_local_storage_token(profile_dir, &source.db_path, keys)
+            match preset {
+                BrowserPreset::Firefox => read_local_storage_token(profile_dir, &source.db_path, key),
+                BrowserPreset::Chrome | BrowserPreset::Yandex => {
+                    if source.origin_host.trim().is_empty() {
+                        bail!("token.origin_host is empty, cannot look up Chromium localStorage");
+                    }
+                    crate::chromium::read_local_storage(profile_dir, &source.origin_host, key)
+                }
+            }
         }
-        TOKEN_KIND_COOKIE => bail!("cookie token source is not implemented yet"),
+        TOKEN_KIND_COOKIE => {
+            let name = source
+                .keys
+                .first()
+                .ok_or_else(|| anyhow!("token.keys is empty for cookie source"))?;
+            match preset {
+                BrowserPreset::Firefox => {
+                    read_firefox_cookie(profile_dir, &source.host_pattern, name)
+                }
+                BrowserPreset::Chrome | BrowserPreset::Yandex => {
+                    crate::chromium::read_cookie(profile_dir, &source.host_pattern, name)
+                }
+            }
+        }
         other => bail!("unknown token source kind: '{other}'"),
     }
+}
+
+/// Reads a plaintext cookie from a Firefox profile (`cookies.sqlite`).
+fn read_firefox_cookie(profile_dir: &Path, host_pattern: &str, name: &str) -> Result<Token> {
+    let db_path = profile_dir.join("cookies.sqlite");
+    if !db_path.is_file() {
+        bail!("cookies.sqlite not found: {}", db_path.display());
+    }
+    let snapshot = snapshot_file(&db_path, "cookies.sqlite")?;
+    let conn = Connection::open_with_flags(&snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open snapshot {}", snapshot.display()))?;
+
+    let mut query = conn
+        .prepare("SELECT host, name, value FROM moz_cookies WHERE name = ?1")
+        .context("failed to query moz_cookies")?;
+    let mut rows = query.query([name]).context("cookie query failed")?;
+    while let Some(row) = rows.next().context("cookie row failed")? {
+        let host: String = row.get(0).unwrap_or_default();
+        if !crate::chromium::host_matches(&host, host_pattern) {
+            continue;
+        }
+        let value: String = row.get(2).unwrap_or_default();
+        if value.is_empty() {
+            continue;
+        }
+        let _ = fs::remove_file(&snapshot);
+        return Ok(Token {
+            key: name.to_owned(),
+            value,
+        });
+    }
+    bail!("cookie '{name}' for '{host_pattern}' not found")
 }
 
 fn read_local_storage_token(profile_dir: &Path, db_rel: &str, key: &str) -> Result<Token> {

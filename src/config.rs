@@ -96,6 +96,10 @@ pub struct TokenSourceConfig {
     pub db_path: String,
     #[serde(default)]
     pub host_pattern: String,
+    /// Origin host for Chromium (LevelDB) localStorage lookup,
+    /// e.g. "chat.deepseek.com". Unused by the Firefox reader.
+    #[serde(default)]
+    pub origin_host: String,
     #[serde(default)]
     pub keys: Vec<String>,
 }
@@ -135,6 +139,7 @@ impl Config {
                     db_path:
                         "storage/default/https+++chat.deepseek.com/ls/data.sqlite".to_owned(),
                     host_pattern: String::new(),
+                    origin_host: "chat.deepseek.com".to_owned(),
                     keys: vec!["userToken".to_owned()],
                 },
             },

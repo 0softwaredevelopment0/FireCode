@@ -2,6 +2,7 @@
 
 mod agent;
 mod auth;
+mod chromium;
 mod config;
 mod deepseek;
 mod fonts;
@@ -1216,12 +1217,6 @@ impl eframe::App for FireCodeApp {
                             self.settings_draft.browser.preset,
                         );
                         ui.monospace(resolved.display().to_string());
-                        if self.settings_draft.browser.preset != settings::BrowserPreset::Firefox {
-                            ui.colored_label(
-                                egui::Color32::YELLOW,
-                                "Chrome/Yandex profiles keep tokens in LevelDB storage - reading is not implemented yet.",
-                            );
-                        }
                         if let Some(error) = &self.settings_error {
                             ui.colored_label(egui::Color32::RED, error);
                         }
