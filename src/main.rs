@@ -1314,6 +1314,7 @@ impl eframe::App for FireCodeApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .stick_to_bottom(true)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
                         ui.add_space(4.0);
                         if self.active.messages.is_empty() && !self.busy {
