@@ -83,6 +83,7 @@ fn spawn_worker(
     base_url: String,
     token: String,
     agent_config: config::AgentConfig,
+    workdir: std::path::PathBuf,
 ) -> (Sender<WorkerCommand>, Receiver<ChatEvent>) {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WorkerCommand>();
     let (event_tx, event_rx) = std::sync::mpsc::channel::<ChatEvent>();
@@ -110,7 +111,6 @@ fn spawn_worker(
                 }
             };
             let shell = agent::Shell::parse(&agent_config.shell);
-            let workdir = agent::resolve_working_dir(&agent_config.working_dir);
             let timeout = std::time::Duration::from_secs(agent_config.timeout_secs);
             let max_steps = agent_config.max_steps;
 
@@ -503,37 +503,39 @@ fn markdown_blocks_ui(
                     .len()
                     .max(rows.iter().map(|r| r.len()).max().unwrap_or(0))
                     .max(1);
-                egui::Grid::new(egui::Id::new((id_salt, bi)))
-                    .striped(true)
-                    .num_columns(cols)
-                    .spacing([16.0, 4.0])
-                    .show(ui, |ui| {
-                        for cell in header {
-                            let job = spans_to_job(
-                                ui,
-                                &markdown::parse_inline(cell),
-                                body,
-                                true,
-                                true,
-                            );
-                            ui.label(job);
-                        }
-                        ui.end_row();
-                        for row in rows {
-                            for ci in 0..cols {
-                                let cell = row.get(ci).map(String::as_str).unwrap_or("");
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    egui::Grid::new(egui::Id::new((id_salt, bi)))
+                        .striped(true)
+                        .num_columns(cols)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for cell in header {
                                 let job = spans_to_job(
                                     ui,
                                     &markdown::parse_inline(cell),
                                     body,
-                                    false,
-                                    false,
+                                    true,
+                                    true,
                                 );
                                 ui.label(job);
                             }
                             ui.end_row();
-                        }
-                    });
+                            for row in rows {
+                                for ci in 0..cols {
+                                    let cell = row.get(ci).map(String::as_str).unwrap_or("");
+                                    let job = spans_to_job(
+                                        ui,
+                                        &markdown::parse_inline(cell),
+                                        body,
+                                        false,
+                                        false,
+                                    );
+                                    ui.label(job);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
                 ui.add_space(4.0);
             }
             Block::Code { lang, code, closed } => code_block_ui(
@@ -693,10 +695,13 @@ impl FireCodeApp {
 
         match (&self.default_token, self.config.site(&self.config.default_site)) {
             (Some(token), Ok(site)) => {
+                let workdir =
+                    agent::resolve_working_dir(&self.settings.agent.working_dir);
                 let (cmd_tx, event_rx) = spawn_worker(
                     site.api_base.clone(),
                     token.clone(),
                     self.config.agent.clone(),
+                    workdir,
                 );
                 self.cmd_tx = Some(cmd_tx);
                 self.event_rx = event_rx;
@@ -1238,6 +1243,17 @@ impl eframe::App for FireCodeApp {
                             "Include AGENTS.md",
                         );
                         ui.weak("When on, AGENTS.md from the exe directory is prepended to every message (checked on each send).");
+                        ui.horizontal(|ui| {
+                            ui.label("Working directory:");
+                            ui.add(
+                                egui::TextEdit::singleline(
+                                    &mut self.settings_draft.agent.working_dir,
+                                )
+                                .hint_text("local")
+                                .desired_width(220.0),
+                            );
+                        });
+                        ui.weak("\"local\" = the folder the app was launched from; anything else is used as a custom path.");
                         ui.add_space(6.0);
                         ui.separator();
                         ui.strong("Browser (token source)");

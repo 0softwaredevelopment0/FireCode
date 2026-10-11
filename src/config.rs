@@ -26,14 +26,12 @@ pub struct Config {
     pub agent: AgentConfig,
 }
 
-/// Coding-agent loop settings. `working_dir` empty = the exe directory
-/// (the app is portable, AGENTS.md lives next to it).
+/// Coding-agent loop settings (engine tuning). The working directory lives
+/// in the user settings (`settings.toml`), not here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default = "default_agent_shell")]
     pub shell: String,
-    #[serde(default)]
-    pub working_dir: String,
     #[serde(default = "default_agent_timeout")]
     pub timeout_secs: u64,
     #[serde(default = "default_agent_max_steps")]
@@ -56,7 +54,6 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             shell: default_agent_shell(),
-            working_dir: String::new(),
             timeout_secs: default_agent_timeout(),
             max_steps: default_agent_max_steps(),
         }

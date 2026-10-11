@@ -52,7 +52,7 @@ impl BrowserPreset {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSettings {
     #[serde(default)]
     pub allow_sudo: bool,
@@ -60,6 +60,24 @@ pub struct AgentSettings {
     /// outgoing user message.
     #[serde(default)]
     pub include_agents_md: bool,
+    /// Agent working directory. `"local"` (the default) means the directory
+    /// the app was launched from; anything else is a custom path.
+    #[serde(default = "default_working_dir")]
+    pub working_dir: String,
+}
+
+fn default_working_dir() -> String {
+    "local".to_owned()
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            allow_sudo: false,
+            include_agents_md: false,
+            working_dir: default_working_dir(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -120,11 +138,18 @@ mod tests {
     }
 
     #[test]
+    fn defaults_point_working_dir_at_local() {
+        let settings = Settings::default();
+        assert_eq!(settings.agent.working_dir, "local");
+    }
+
+    #[test]
     fn settings_round_trip() {
         let settings = Settings {
             agent: AgentSettings {
                 allow_sudo: true,
                 include_agents_md: true,
+                working_dir: "C:\\work".to_owned(),
             },
             browser: BrowserSettings {
                 preset: BrowserPreset::Chrome,
@@ -134,6 +159,7 @@ mod tests {
         let parsed: Settings = toml::from_str(&raw).expect("parse");
         assert!(parsed.agent.allow_sudo);
         assert!(parsed.agent.include_agents_md);
+        assert_eq!(parsed.agent.working_dir, "C:\\work");
         assert_eq!(parsed.browser.preset, BrowserPreset::Chrome);
     }
 

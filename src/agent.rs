@@ -188,14 +188,18 @@ pub struct CommandOutput {
     pub timed_out: bool,
 }
 
+/// Resolves the agent working directory: `"local"` (or empty) means the
+/// directory the app was launched from (the exe directory); anything else
+/// is used as a custom path as-is.
 pub fn resolve_working_dir(configured: &str) -> PathBuf {
-    if !configured.trim().is_empty() {
-        return PathBuf::from(configured);
+    let trimmed = configured.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("local") {
+        return std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."));
     }
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
+    PathBuf::from(trimmed)
 }
 
 /// Runs one command in a fresh shell and captures combined output.
@@ -656,6 +660,23 @@ mod tests {
         assert!(!looks_like_sudo("echo sudo"));
         assert!(!looks_like_sudo("sudoers"));
         assert!(!looks_like_sudo(""));
+    }
+
+    #[test]
+    fn resolve_working_dir_local_means_exe_dir() {
+        let exe_dir = std::env::current_exe()
+            .expect("exe")
+            .parent()
+            .expect("parent")
+            .to_path_buf();
+        assert_eq!(resolve_working_dir("local"), exe_dir);
+        assert_eq!(resolve_working_dir("LOCAL"), exe_dir);
+        assert_eq!(resolve_working_dir("  local  "), exe_dir);
+        assert_eq!(resolve_working_dir(""), exe_dir);
+        assert_eq!(
+            resolve_working_dir("C:\\work"),
+            std::path::PathBuf::from("C:\\work")
+        );
     }
 
     /// Runs a real shell on this machine.
