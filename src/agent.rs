@@ -64,13 +64,21 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
     for line in raw.lines() {
         let trimmed = line.trim();
         if multi.is_some() {
-            if trimmed == "<command-footer>" {
+            // a new header always starts a new command, even if the previous
+            // block missed its footer - blocks can never merge this way
+            if trimmed == "<command-header>" {
+                flush_multi(&mut multi, &mut commands);
+                multi = Some(Vec::new());
+            } else if trimmed == "<command-footer>" {
                 flush_multi(&mut multi, &mut commands);
             } else if let Some(cmd) = extract_string_line(trimmed) {
                 multi
                     .as_mut()
                     .expect("multiline block open")
                     .push(cmd);
+            } else if let Some(cmd) = extract_single_command(trimmed) {
+                flush_multi(&mut multi, &mut commands);
+                commands.push(cmd);
             }
             continue;
         }
@@ -78,12 +86,7 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
             multi = Some(Vec::new());
             continue;
         }
-        if let Some(cmd) = trimmed
-            .strip_prefix("<command:\"")
-            .and_then(|rest| rest.strip_suffix("\">"))
-            .map(|inner| unescape_command_string(inner.trim()))
-            .filter(|cmd| !cmd.is_empty())
-        {
+        if let Some(cmd) = extract_single_command(trimmed) {
             commands.push(cmd);
             continue;
         }
@@ -102,6 +105,15 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
         commands,
         continue_next,
     }
+}
+
+/// Extracts one `<command:"...">` line (with unescaping), if it matches.
+fn extract_single_command(trimmed: &str) -> Option<String> {
+    trimmed
+        .strip_prefix("<command:\"")
+        .and_then(|rest| rest.strip_suffix("\">"))
+        .map(|inner| unescape_command_string(inner.trim()))
+        .filter(|cmd| !cmd.is_empty())
 }
 
 /// Extracts one `<string:...>` line: the double-quoted form unescapes,
@@ -336,6 +348,8 @@ Every line inside must use the `<string:"...">` syntax:
 
 The lines run together as one multiline command, top to bottom. The same
 rules as single-line commands apply (fresh shell, non-interactive, headless).
+A new `<command-header>` always starts a new command, even if the previous
+block missed its footer - blocks never merge.
 
 ### Quoting inside `<string:"...">` (and `<command:"...">`)
 
@@ -563,6 +577,36 @@ mod tests {
     fn parse_escaped_single_line_command() {
         let parsed = parse_response("<command:\"echo \\\"hi\\\"\">");
         assert_eq!(parsed.commands, vec!["echo \"hi\"".to_owned()]);
+    }
+
+    #[test]
+    fn parse_header_without_footer_splits_blocks() {
+        let raw = "<command-header>\n<string:\"echo a\">\n<command-header>\n<string:\"echo b\">\n<command-footer>";
+        let parsed = parse_response(raw);
+        assert_eq!(
+            parsed.commands,
+            vec!["echo a".to_owned(), "echo b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parse_single_command_inside_block_flushes() {
+        let raw = "<command-header>\n<string:\"echo a\">\n<command:\"git status\">\n<command-footer>";
+        let parsed = parse_response(raw);
+        assert_eq!(
+            parsed.commands,
+            vec!["echo a".to_owned(), "git status".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parse_two_adjacent_blocks_are_two_commands() {
+        let raw = "<command-header>\n<string:\"test\">\n<string:\"test\">\n<command-footer>\n<command-header>\n<string:\"test\">\n<string:\"test\">\n<command-footer>";
+        let parsed = parse_response(raw);
+        assert_eq!(
+            parsed.commands,
+            vec!["test\ntest".to_owned(), "test\ntest".to_owned()]
+        );
     }
 
     #[test]
