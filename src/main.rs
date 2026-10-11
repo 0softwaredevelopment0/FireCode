@@ -582,7 +582,7 @@ fn markdown_blocks_ui(
 
 /// Command execution output: full-width window (always stretched to the
 /// right edge, adaptive on resize) with a clickable header button. Collapsed
-/// by default to a 20-row scrollable preview (mouse wheel or scrollbar);
+/// by default to a 10-row scrollable preview (mouse wheel or scrollbar);
 /// clicking the header toggles the full output. An empty body renders the
 /// header button only (no frame).
 fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) {
@@ -634,7 +634,7 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
                 } else {
                     egui::ScrollArea::vertical()
                         .id_salt(id.with("scroll"))
-                        .max_height(row_h * 20.0)
+                        .max_height(row_h * 10.0)
                         .show(ui, |ui| {
                             ui.monospace(body);
                         });
@@ -1487,16 +1487,15 @@ impl eframe::App for FireCodeApp {
                                     );
                                 }
                                 "command" => {
-                                    let mut lines = message.text.lines();
-                                    let header = lines.next().unwrap_or("$");
-                                    let body: String =
-                                        lines.collect::<Vec<_>>().join("\n");
-                                    command_output_ui(
-                                        ui,
-                                        egui::Id::new(("cmdblock", mi)),
-                                        header,
-                                        &body,
-                                    );
+                                    // plain command line only; the single
+                                    // output window is the feedback message
+                                    // that follows - no second window here
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.weak(
+                                            egui::RichText::new(&message.text)
+                                                .monospace(),
+                                        );
+                                    });
                                 }
                                 "feedback" => {
                                     ui.strong("⚙ Feedback:");
