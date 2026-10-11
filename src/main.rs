@@ -1104,7 +1104,7 @@ impl eframe::App for FireCodeApp {
                         }
                     });
                     ui.separator();
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    egui::Panel::bottom("sessions_bottom").show(ui, |ui| {
                         if ui
                             .add_sized(
                                 [ui.available_width(), 22.0],
@@ -1120,6 +1120,12 @@ impl eframe::App for FireCodeApp {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let active_id = self.active.id.clone();
                         let mut open_request: Option<(String, String)> = None;
+                        if self.sessions.is_empty() && !self.busy {
+                            ui.colored_label(
+                                egui::Color32::GRAY,
+                                "No chats found.",
+                            );
+                        }
                         for session in &self.sessions {
                             let is_active = active_id.as_deref() == Some(session.id.as_str());
                             let label = if session.title.is_empty() {
