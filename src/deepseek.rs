@@ -1,4 +1,4 @@
-use std::time::Duration;
+﻿use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
@@ -27,6 +27,13 @@ struct ApiResponse {
 struct ChallengeEnvelope {
     #[serde(default)]
     data: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletionOptions {
+    pub model_class: String,
+    pub thinking_enabled: bool,
+    pub search_enabled: bool,
 }
 
 impl DeepSeekClient {
@@ -93,8 +100,7 @@ impl DeepSeekClient {
         session_id: &str,
         prompt: &str,
         parent_message_id: Option<i64>,
-        model_class: &str,
-        thinking_enabled: bool,
+        options: &CompletionOptions,
     ) -> Result<reqwest::Response> {
         let target_path = "/api/v0/chat/completion";
         let challenge = self.create_pow_challenge(target_path).await?;
@@ -107,8 +113,9 @@ impl DeepSeekClient {
             "prompt": prompt,
             "ref_file_ids": [],
             "parent_message_id": parent_message_id,
-            "thinking_enabled": thinking_enabled,
-            "model_class": model_class,
+            "thinking_enabled": options.thinking_enabled,
+            "search_enabled": options.search_enabled,
+            "model_class": options.model_class,
         });
 
         let resp = self
@@ -204,19 +211,27 @@ impl DeepSeekClient {
                     Some("USER") => "user",
                     _ => "assistant",
                 };
+                let mut thinking = String::new();
                 let mut text = String::new();
                 if let Some(frags) = m["fragments"].as_array() {
                     for frag in frags {
-                        if frag["type"] == Value::String("RESPONSE".into())
-                            || frag["type"] == Value::String("USER".into())
-                        {
-                            text.push_str(frag["content"].as_str().unwrap_or(""));
+                        let content = frag["content"].as_str().unwrap_or("");
+                        match frag["type"].as_str() {
+                            Some("THINK") | Some("THINKING") => thinking.push_str(content),
+                            Some("RESPONSE") | Some("USER") => text.push_str(content),
+                            _ => {}
                         }
                     }
                 }
+                let thinking = if thinking.trim().is_empty() {
+                    None
+                } else {
+                    Some(thinking)
+                };
                 let message_id = m["message_id"].as_i64();
                 HistoryMessage {
                     role: role.to_owned(),
+                    thinking,
                     text,
                     message_id,
                 }
@@ -227,20 +242,67 @@ impl DeepSeekClient {
 
 /// Accumulates the assistant answer from SSE `data:` payloads.
 ///
-/// Stream payload kinds seen in the wild:
+/// The assistant message is a list of fragments (`THINKING`, `RESPONSE`,
+/// search-result fragments). Stream payload kinds seen in the wild:
 /// - full snapshot: `{"v": {"response": {"fragments": [...]}}}`
+/// - fragment creation: `{"p": "response/fragments", "o": "APPEND", "v": [frags]}`
 /// - patch: `{"p": "response/fragments/-1/content", "o": "APPEND", "v": "..."}`
-/// - continuation: `{"v": "..."}` (no p/o) - appends to the last APPEND target;
+/// - continuation: `{"v": "..."}` (no p/o) - appends to the last fragment;
 ///   this is how most tokens arrive, dropping them truncates the answer
-/// - batch: `{"p": "response", "o": "BATCH", "v": [patches or continuations]}`
+/// - batch: `{"p": "response", "o": "BATCH", "v": [...]}` - items carry
+///   paths relative to `response` (e.g. `"fragments"`)
 #[derive(Default)]
 pub struct ResponseAccumulator {
+    fragments: Vec<Fragment>,
+    /// Content that arrived before the server created any fragment. Such
+    /// streams (e.g. DeepThink) start with content patches while the fragment
+    /// list is still empty; the implicit fragment is classified once the
+    /// server reveals fragment types.
+    implicit: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct Fragment {
+    ftype: String,
+    content: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AccumulatedAnswer {
+    pub thinking: Option<String>,
     pub text: String,
-    last_append_is_content: bool,
 }
 
 impl ResponseAccumulator {
-    /// Feeds one `data:` payload; returns true when the accumulated text changed.
+    pub fn answer(&self) -> AccumulatedAnswer {
+        let mut out = AccumulatedAnswer::default();
+        let mut thinking = String::new();
+        for frag in &self.fragments {
+            match frag.ftype.as_str() {
+                // the real wire type is "THINK"; accept THINKING defensively
+                "THINK" | "THINKING" => thinking.push_str(&frag.content),
+                "RESPONSE" => out.text.push_str(&frag.content),
+                _ => {}
+            }
+        }
+        // Unresolved implicit content: it preceded every known fragment, so
+        // if a RESPONSE fragment exists the implicit part was reasoning.
+        if let Some(imp) = &self.implicit {
+            if !imp.is_empty() {
+                if self.fragments.iter().any(|f| f.ftype == "RESPONSE") {
+                    thinking.insert_str(0, imp);
+                } else {
+                    out.text.insert_str(0, imp);
+                }
+            }
+        }
+        if !thinking.trim().is_empty() {
+            out.thinking = Some(thinking);
+        }
+        out
+    }
+
+    /// Feeds one `data:` payload; returns true when the answer changed.
     pub fn feed(&mut self, payload: &str) -> bool {
         let Ok(v) = serde_json::from_str::<Value>(payload) else {
             return false;
@@ -254,56 +316,120 @@ impl ResponseAccumulator {
             v.get("p").and_then(Value::as_str),
             v.get("o").and_then(Value::as_str),
         ) {
-            match o {
-                "APPEND" => {
-                    self.last_append_is_content = p.ends_with("content");
-                    if self.last_append_is_content {
-                        if let Some(add) = v.get("v").and_then(Value::as_str) {
-                            self.text.push_str(add);
-                            return !add.is_empty();
-                        }
+            return match o {
+                "APPEND" => match p {
+                    "response/fragments" | "fragments" => {
+                        self.append_fragments(v.get("v"))
                     }
-                }
+                    _ if p.ends_with("/content") => {
+                        self.append_to_last_fragment(v.get("v").and_then(Value::as_str))
+                    }
+                    _ => false,
+                },
                 "BATCH" => {
                     if let Some(items) = v.get("v").and_then(Value::as_array) {
                         let mut changed = false;
                         for item in items {
-                            changed |= self.feed(&item.to_string());
+                            changed |= self.feed_nested(item);
                         }
                         return changed;
                     }
+                    false
                 }
-                _ => {}
-            }
-            return false;
+                _ => false,
+            };
         }
-        // Bare `{"v": "..."}` (no p at all): continuation of the last APPEND
-        // target. Payloads carrying a `p` but no `o` (e.g. quasi_status) are
-        // NOT continuations.
-        if self.last_append_is_content && v.get("p").is_none() {
+        // Bare `{"v": "..."}` (no p at all): continuation of the last fragment.
+        // Payloads carrying a `p` but no `o` (results, quasi_status) are NOT
+        // continuations.
+        if v.get("p").is_none() {
             if let Some(add) = v.get("v").and_then(Value::as_str) {
-                self.text.push_str(add);
-                return !add.is_empty();
+                return self.append_to_last_fragment(Some(add));
             }
         }
         false
+    }
+
+    /// BATCH items carry paths relative to `response`: only fragment-list
+    /// patches are meaningful here; content paths inside batches belong to
+    /// search fragments and other non-answer fragments, so they are skipped.
+    fn feed_nested(&mut self, item: &Value) -> bool {
+        let p = item.get("p").and_then(Value::as_str);
+        let o = item.get("o").and_then(Value::as_str);
+        match (p, o) {
+            (Some("response/fragments") | Some("fragments"), Some("APPEND")) => {
+                self.append_fragments(item.get("v"))
+            }
+            _ => false,
+        }
+    }
+
+    fn append_fragments(&mut self, v: Option<&Value>) -> bool {
+        let Some(items) = v.and_then(Value::as_array) else {
+            return false;
+        };
+        let before = self.answer();
+        self.reconcile_implicit();
+        for frag in items {
+            self.fragments.push(Fragment {
+                ftype: frag["type"].as_str().unwrap_or("").to_owned(),
+                content: frag["content"].as_str().unwrap_or("").to_owned(),
+            });
+        }
+        self.answer() != before
+    }
+
+    fn append_to_last_fragment(&mut self, add: Option<&str>) -> bool {
+        let Some(add) = add else {
+            return false;
+        };
+        if add.is_empty() {
+            return false;
+        }
+        let before = self.answer();
+        if let Some(last) = self.fragments.last_mut() {
+            last.content.push_str(add);
+        } else {
+            self.implicit.get_or_insert_default().push_str(add);
+        }
+        self.answer() != before
+    }
+
+    /// The implicit fragment always precedes every server-declared fragment,
+    /// and content that streams before a RESPONSE fragment is reasoning.
+    fn reconcile_implicit(&mut self) {
+        let Some(imp) = self.implicit.take() else {
+            return;
+        };
+        if imp.is_empty() || self.fragments.is_empty() {
+            self.implicit = Some(imp);
+            return;
+        }
+        self.fragments.insert(
+            0,
+            Fragment {
+                ftype: "THINKING".to_owned(),
+                content: imp,
+            },
+        );
     }
 
     fn apply_snapshot(&mut self, snapshot: &Value) -> bool {
         let Some(frags) = snapshot["response"]["fragments"].as_array() else {
             return false;
         };
-        for frag in frags.iter().rev() {
-            if frag["type"] == Value::String("RESPONSE".into()) {
-                let content = frag["content"].as_str().unwrap_or("");
-                if self.text != content {
-                    self.text = content.to_owned();
-                    return true;
-                }
-                return false;
-            }
-        }
-        false
+        let before = self.answer();
+        // Server snapshots are authoritative state; drop any implicit content
+        // (it is already included in the snapshot's fragments).
+        self.implicit = None;
+        self.fragments = frags
+            .iter()
+            .map(|frag| Fragment {
+                ftype: frag["type"].as_str().unwrap_or("").to_owned(),
+                content: frag["content"].as_str().unwrap_or("").to_owned(),
+            })
+            .collect();
+        self.answer() != before
     }
 }
 
@@ -316,6 +442,7 @@ pub struct SessionInfo {
 #[derive(Debug, Clone)]
 pub struct HistoryMessage {
     pub role: String,
+    pub thinking: Option<String>,
     pub text: String,
     pub message_id: Option<i64>,
 }
@@ -372,17 +499,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
+
+    fn snapshot(thinking: &str, response: &str) -> String {
+        format!(
+            r#"{{"v":{{"response":{{"fragments":[
+            {{"id":1,"type":"THINK","content":"{thinking}"}},
+            {{"id":2,"type":"RESPONSE","content":"{response}"}}]}}}}}}"#
+        )
+    }
 
     #[test]
     fn accumulator_handles_snapshot_then_appends() {
         let mut acc = ResponseAccumulator::default();
-        let snapshot = r#"{"v":{"response":{"fragments":[
-            {"id":1,"type":"THINKING","content":"hmm"},
-            {"id":2,"type":"RESPONSE","content":"p"}]}}}"#;
-        assert!(acc.feed(snapshot));
-        assert_eq!(acc.text, "p");
+        assert!(acc.feed(&snapshot("hmm", "p")));
+        let a = acc.answer();
+        assert_eq!(a.text, "p");
+        assert_eq!(a.thinking.as_deref(), Some("hmm"));
         assert!(acc.feed(r#"{"p":"response/fragments/-1/content","o":"APPEND","v":"ong"}"#));
-        assert_eq!(acc.text, "pong");
+        assert_eq!(acc.answer().text, "pong");
         assert!(!acc.feed(r#"{"p":"response/fragments/-1/content","o":"APPEND","v":""}"#));
     }
 
@@ -394,17 +529,21 @@ mod tests {
         ));
         assert!(acc.feed(r#"{"v":" Deep"}"#));
         assert!(acc.feed(r#"{"v":"Seek"}"#));
-        assert_eq!(acc.text, "Я — DeepSeek");
-        // title/close payloads must not touch the text
+        assert_eq!(acc.answer().text, "Я — DeepSeek");
+        // title payloads have neither v nor p - must not touch the text
         assert!(!acc.feed(r#"{"content":"DeepSeek модель"}"#));
-        assert_eq!(acc.text, "Я — DeepSeek");
+        assert_eq!(acc.answer().text, "Я — DeepSeek");
     }
 
     #[test]
-    fn accumulator_bare_v_ignored_without_preceding_append() {
+    fn accumulator_bare_v_goes_to_implicit_text_without_fragments() {
         let mut acc = ResponseAccumulator::default();
-        assert!(!acc.feed(r#"{"v":"orphan"}"#));
-        assert_eq!(acc.text, "");
+        // content before any fragment exists is captured as implicit
+        assert!(acc.feed(r#"{"v":"orphan"}"#));
+        assert_eq!(acc.answer().text, "orphan");
+        // payloads without a string "v" change nothing
+        assert!(!acc.feed(r#"{"content":"title"}"#));
+        assert_eq!(acc.answer().text, "orphan");
     }
 
     #[test]
@@ -416,28 +555,25 @@ mod tests {
             r#"{"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":99},{"p":"quasi_status","v":"FINISHED"}]}"#
         ));
         assert!(!acc.feed(r#"{"p":"response/status","o":"SET","v":"FINISHED"}"#));
-        assert_eq!(acc.text, "pong");
+        assert_eq!(acc.answer().text, "pong");
     }
 
     #[test]
-    fn accumulator_handles_batch_patches_and_continuations() {
+    fn accumulator_batch_creates_fragments_and_ignores_scalars() {
         let mut acc = ResponseAccumulator::default();
-        let batch = r#"{"p":"response","o":"BATCH","v":[
-            {"p":"response/fragments/-1/content","o":"APPEND","v":"he"},
-            {"v":"y"},
-            {"p":"accumulated_token_usage","v":42}]}"#;
-        assert!(acc.feed(batch));
-        assert_eq!(acc.text, "hey");
+        assert!(acc.feed(r#"{"p":"response","o":"BATCH","v":[
+            {"p":"fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"he","references":[],"stage_id":2}]},
+            {"p":"has_pending_fragment","o":"SET","v":false}]}"#));
+        assert!(acc.feed(r#"{"v":"y"}"#));
+        assert_eq!(acc.answer().text, "hey");
     }
 
     #[test]
     fn accumulator_replaces_text_on_late_snapshot() {
         let mut acc = ResponseAccumulator::default();
         assert!(acc.feed(r#"{"p":"response/fragments/-1/content","o":"APPEND","v":"par"}"#));
-        let snapshot = r#"{"v":{"response":{"fragments":[
-            {"id":2,"type":"RESPONSE","content":"partial text"}]}}}"#;
-        assert!(acc.feed(snapshot));
-        assert_eq!(acc.text, "partial text");
+        assert!(acc.feed(&snapshot("", "partial text")));
+        assert_eq!(acc.answer().text, "partial text");
     }
 
     #[test]
@@ -445,14 +581,57 @@ mod tests {
         let mut acc = ResponseAccumulator::default();
         assert!(!acc.feed("not json"));
         assert!(!acc.feed(r#"{"p":"accumulated_token_usage","o":"BATCH","v":[]}"#));
-        assert_eq!(acc.text, "");
+        assert_eq!(acc.answer().text, "");
     }
 
-    /// Full round trip against the real DeepSeek account on this machine.
-    /// Run explicitly: cargo test --release -- --ignored
-    #[tokio::test]
-    #[ignore = "requires the real Firefox profile and sends real messages"]
-    async fn real_round_trip_replies_pong() {
+    #[test]
+    fn accumulator_thinking_flow_from_real_dump() {
+        let mut acc = ResponseAccumulator::default();
+        // the initial snapshot carries the first THINK tokens
+        assert!(acc.feed(
+            r#"{"v":{"response":{"message_id":2,"thinking_enabled":true,"fragments":[{"id":2,"type":"THINK","content":"We","elapsed_secs":null,"stage_id":1}]}}}"#
+        ));
+        assert_eq!(acc.answer().thinking.as_deref(), Some("We"));
+        assert!(acc.feed(r#"{"p":"response/fragments/-1/content","o":"APPEND","v":" need"}"#));
+        assert!(acc.feed(r#"{"v":" answer."}"#));
+        assert!(!acc.feed(
+            r#"{"p":"response/fragments/-1/elapsed_secs","o":"SET","v":0.78}"#
+        ));
+        assert_eq!(
+            acc.answer().thinking.as_deref(),
+            Some("We need answer.")
+        );
+        assert!(acc.feed(
+            r#"{"p":"response/fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"255","references":[],"stage_id":1}]}"#
+        ));
+        let a = acc.answer();
+        assert_eq!(a.text, "255");
+        assert_eq!(a.thinking.as_deref(), Some("We need answer."));
+    }
+
+    #[test]
+    fn accumulator_search_flow_from_real_dump() {
+        let mut acc = ResponseAccumulator::default();
+        // search results patch: p without o - not a continuation
+        assert!(!acc.feed(
+            r#"{"p":"response/fragments/-1/results","v":[{"url":"https://x","title":"t","snippet":"s"}]}"#
+        ));
+        // search-fragment content arrives in a nested fragment BATCH - ignored
+        assert!(!acc.feed(
+            r#"{"p":"response/fragments/-1","o":"BATCH","v":[{"p":"status","v":"FINISHED"},{"p":"content","v":"Found 12 web pages"}]}"#
+        ));
+        assert!(!acc.feed(r#"{"p":"response/conversation_mode","o":"SET","v":"SEARCH"}"#));
+        assert!(acc.feed(r#"{"p":"response","o":"BATCH","v":[
+            {"p":"fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"The","references":[],"stage_id":2}]},
+            {"p":"has_pending_fragment","o":"SET","v":false}]}"#));
+        assert!(acc.feed(r#"{"p":"response/fragments/-1/content","o":"APPEND","v":" current"}"#));
+        assert!(acc.feed(r#"{"v":" stable **1.96.1**[citation:2]."}"#));
+        let a = acc.answer();
+        assert_eq!(a.text, "The current stable **1.96.1**[citation:2].");
+        assert_eq!(a.thinking, None);
+    }
+
+    fn real_client() -> (DeepSeekClient, config::Config) {
         let (config, _) = crate::config::load_or_create().expect("config");
         let site = config.site(&config.default_site).expect("site");
         let token = crate::auth::read_token(
@@ -461,11 +640,28 @@ mod tests {
         )
         .expect("token")
         .value;
-
         let client = DeepSeekClient::new(&site.api_base, &token).expect("client");
+        (client, config)
+    }
+
+    /// Full round trip against the real DeepSeek account on this machine.
+    /// Run explicitly: cargo test --release -- --ignored
+    #[tokio::test]
+    #[ignore = "requires the real Firefox profile and sends real messages"]
+    async fn real_round_trip_replies_pong() {
+        let (client, config) = real_client();
         let session = client.create_session().await.expect("session");
+        let options = CompletionOptions {
+            model_class: config
+                .preset(&config.default_preset)
+                .expect("preset")
+                .model_class
+                .clone(),
+            thinking_enabled: false,
+            search_enabled: false,
+        };
         let resp = client
-            .completion(&session, "Reply with exactly: pong", None, "deepseek_chat", false)
+            .completion(&session, "Reply with exactly: pong", None, &options)
             .await
             .expect("completion");
         assert_eq!(
@@ -482,8 +678,43 @@ mod tests {
         })
         .await
         .expect("stream");
-        println!("assistant: {:?}", acc.text);
-        assert_eq!(acc.text.trim(), "pong");
+        println!("assistant: {:?}", acc.answer().text);
+        assert_eq!(acc.answer().text.trim(), "pong");
+    }
+
+    /// Round trip with DeepThink enabled: reasoning must arrive separately.
+    /// Run explicitly: cargo test --release -- --ignored
+    #[tokio::test]
+    #[ignore = "requires the real Firefox profile and sends real messages"]
+    async fn real_thinking_round_trip_separates_reasoning() {
+        let (client, _config) = real_client();
+        let session = client.create_session().await.expect("session");
+        let options = CompletionOptions {
+            model_class: "deepseek_chat".to_owned(),
+            thinking_enabled: true,
+            search_enabled: false,
+        };
+        let resp = client
+            .completion(
+                &session,
+                "What is 15*17? Think briefly, then answer with just the number.",
+                None,
+                &options,
+            )
+            .await
+            .expect("completion");
+
+        let mut acc = ResponseAccumulator::default();
+        let _ = pump_sse(resp, |_event, payload| {
+            acc.feed(payload);
+        })
+        .await
+        .expect("stream");
+        let a = acc.answer();
+        println!("thinking: {:?}", a.thinking.as_deref().map(str::len));
+        println!("text: {:?}", a.text);
+        assert!(a.thinking.is_some(), "reasoning must arrive for DeepThink");
+        assert!(!a.text.trim().is_empty(), "answer text must be present");
     }
 
     /// Verifies session listing and history against the real account.
@@ -491,16 +722,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires the real Firefox profile and a logged-in account"]
     async fn real_sessions_list_and_history() {
-        let (config, _) = crate::config::load_or_create().expect("config");
-        let site = config.site(&config.default_site).expect("site");
-        let token = crate::auth::read_token(
-            std::path::Path::new(&config.profile.path),
-            &site.token,
-        )
-        .expect("token")
-        .value;
-
-        let client = DeepSeekClient::new(&site.api_base, &token).expect("client");
+        let (client, _config) = real_client();
         let sessions = client.list_sessions(20).await.expect("list");
         println!("sessions: {}", sessions.len());
         for s in sessions.iter().take(5) {
@@ -521,7 +743,9 @@ mod tests {
             "history contains a user message"
         );
         assert!(
-            history.iter().any(|m| m.role == "assistant" && !m.text.trim().is_empty()),
+            history
+                .iter()
+                .any(|m| m.role == "assistant" && !m.text.trim().is_empty()),
             "history contains a non-empty assistant message"
         );
     }

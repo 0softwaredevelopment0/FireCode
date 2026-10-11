@@ -20,8 +20,7 @@ enum WorkerCommand {
         session_id: Option<String>,
         parent_message_id: Option<i64>,
         text: String,
-        model_class: String,
-        thinking_enabled: bool,
+        options: deepseek::CompletionOptions,
     },
     LoadHistory {
         session_id: String,
@@ -29,8 +28,21 @@ enum WorkerCommand {
     RefreshSessions,
 }
 
+#[derive(Debug, Clone)]
+struct ChatMessage {
+    role: &'static str,
+    thinking: Option<String>,
+    text: String,
+}
+
+#[derive(Default, Clone)]
+struct StreamingAnswer {
+    thinking: Option<String>,
+    text: String,
+}
+
 enum ChatEvent {
-    Delta { text: String },
+    Delta(StreamingAnswer),
     Finished {
         result: Result<(), String>,
         last_message_id: Option<i64>,
@@ -39,7 +51,7 @@ enum ChatEvent {
     TitleSet { session_id: String, title: String },
     HistoryLoaded {
         session_id: String,
-        messages: Vec<(&'static str, String)>,
+        messages: Vec<ChatMessage>,
         last_message_id: Option<i64>,
     },
     SessionsLoaded {
@@ -80,8 +92,7 @@ fn spawn_worker(base_url: String, token: String) -> (Sender<WorkerCommand>, Rece
                         session_id,
                         parent_message_id,
                         text,
-                        model_class,
-                        thinking_enabled,
+                        options,
                     } => {
                         let sid = match session_id {
                             Some(sid) => sid,
@@ -105,8 +116,7 @@ fn spawn_worker(base_url: String, token: String) -> (Sender<WorkerCommand>, Rece
                             &sid,
                             &text,
                             parent_message_id,
-                            &model_class,
-                            thinking_enabled,
+                            &options,
                             &event_tx,
                         )
                         .await;
@@ -129,10 +139,10 @@ fn spawn_worker(base_url: String, token: String) -> (Sender<WorkerCommand>, Rece
                                     session_id,
                                     messages: messages
                                         .into_iter()
-                                        .map(|m| {
-                                            let role: &'static str =
-                                                if m.role == "user" { "user" } else { "assistant" };
-                                            (role, m.text)
+                                        .map(|m| ChatMessage {
+                                            role: if m.role == "user" { "user" } else { "assistant" },
+                                            thinking: m.thinking,
+                                            text: m.text,
                                         })
                                         .collect(),
                                     last_message_id,
@@ -168,18 +178,11 @@ async fn try_prompt(
     session_id: &str,
     prompt: &str,
     parent_message_id: Option<i64>,
-    model_class: &str,
-    thinking_enabled: bool,
+    options: &deepseek::CompletionOptions,
     event_tx: &Sender<ChatEvent>,
 ) -> Result<Option<i64>, anyhow::Error> {
     let resp = client
-        .completion(
-            session_id,
-            prompt,
-            parent_message_id,
-            model_class,
-            thinking_enabled,
-        )
+        .completion(session_id, prompt, parent_message_id, options)
         .await?;
     let mut acc = deepseek::ResponseAccumulator::default();
     let sid = session_id.to_owned();
@@ -197,9 +200,11 @@ async fn try_prompt(
             return;
         }
         if acc.feed(payload) {
-            let _ = tx.send(ChatEvent::Delta {
-                text: acc.text.clone(),
-            });
+            let a = acc.answer();
+            let _ = tx.send(ChatEvent::Delta(StreamingAnswer {
+                thinking: a.thinking,
+                text: a.text,
+            }));
         }
     })
     .await?;
@@ -209,8 +214,20 @@ async fn try_prompt(
 struct ActiveSession {
     id: Option<String>,
     title: String,
-    messages: Vec<(&'static str, String)>,
+    messages: Vec<ChatMessage>,
     last_message_id: Option<i64>,
+    deepthink: bool,
+    search: bool,
+}
+
+/// Remembered DeepThink/Search toggles per chat id (like the web app,
+/// they are per-chat settings). New chats start from the preset default.
+fn default_toggles(config: &config::Config) -> (bool, bool) {
+    let thinking = config
+        .preset(&config.default_preset)
+        .map(|p| p.thinking_enabled)
+        .unwrap_or(false);
+    (thinking, false)
 }
 
 struct FireCodeApp {
@@ -220,9 +237,10 @@ struct FireCodeApp {
     default_token: Option<String>,
     sessions: Vec<deepseek::SessionInfo>,
     active: ActiveSession,
+    toggles: BTreeMap<String, (bool, bool)>,
     busy: bool,
     input: String,
-    streaming_text: Option<String>,
+    streaming: Option<StreamingAnswer>,
     preset_ids: Vec<String>,
     preset_selected: usize,
     event_rx: Receiver<ChatEvent>,
@@ -236,6 +254,10 @@ impl FireCodeApp {
             .iter()
             .position(|id| *id == config.default_preset)
             .unwrap_or(0);
+        let default_deepthink = config
+            .preset(&config.default_preset)
+            .map(|p| p.thinking_enabled)
+            .unwrap_or(false);
         let mut app = Self {
             config,
             config_path,
@@ -247,10 +269,13 @@ impl FireCodeApp {
                 title: "New chat".to_owned(),
                 messages: Vec::new(),
                 last_message_id: None,
+                deepthink: default_deepthink,
+                search: false,
             },
+            toggles: BTreeMap::new(),
             busy: false,
             input: String::new(),
-            streaming_text: None,
+            streaming: None,
             preset_ids,
             preset_selected,
             event_rx: std::sync::mpsc::channel().1,
@@ -316,13 +341,20 @@ impl FireCodeApp {
         if self.busy {
             return;
         }
+        let (deepthink, search) = self
+            .toggles
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| default_toggles(&self.config));
         self.active = ActiveSession {
             id: Some(id),
             title,
             messages: Vec::new(),
             last_message_id: None,
+            deepthink,
+            search,
         };
-        if let Some(cmd_tx) = &self.cmd_tx {
+        if let Some(cmd_tx) = self.cmd_tx.clone() {
             self.busy = true;
             let _ = cmd_tx.send(WorkerCommand::LoadHistory {
                 session_id: self.active.id.clone().expect("id set above"),
@@ -334,13 +366,29 @@ impl FireCodeApp {
         if self.busy {
             return;
         }
+        let (deepthink, search) = default_toggles(&self.config);
         self.active = ActiveSession {
             id: None,
             title: "New chat".to_owned(),
             messages: Vec::new(),
             last_message_id: None,
+            deepthink,
+            search,
         };
-        self.streaming_text = None;
+        self.streaming = None;
+    }
+
+    fn toggle_active(&mut self, which: u8) {
+        let (mut deepthink, mut search) = (self.active.deepthink, self.active.search);
+        match which {
+            0 => deepthink = !deepthink,
+            _ => search = !search,
+        }
+        self.active.deepthink = deepthink;
+        self.active.search = search;
+        if let Some(id) = self.active.id.clone() {
+            self.toggles.insert(id, (deepthink, search));
+        }
     }
 
     fn send_message(&mut self) {
@@ -351,24 +399,32 @@ impl FireCodeApp {
         let Some(cmd_tx) = self.cmd_tx.clone() else {
             return;
         };
-        let Some(preset) = self.config.preset(self.selected_preset_id()).ok() else {
-            return;
-        };
-        let preset = preset.clone();
-        self.messages_push(("user", text.clone()));
+        let model_class = self
+            .config
+            .preset(self.selected_preset_id())
+            .map(|p| p.model_class.clone())
+            .unwrap_or_else(|_| "deepseek_chat".to_owned());
+        self.messages_push(ChatMessage {
+            role: "user",
+            thinking: None,
+            text: text.clone(),
+        });
         self.input.clear();
-        self.streaming_text = Some(String::new());
+        self.streaming = Some(StreamingAnswer::default());
         self.busy = true;
         let _ = cmd_tx.send(WorkerCommand::Prompt {
             session_id: self.active.id.clone(),
             parent_message_id: self.active.last_message_id,
             text,
-            model_class: preset.model_class,
-            thinking_enabled: preset.thinking_enabled,
+            options: deepseek::CompletionOptions {
+                model_class,
+                thinking_enabled: self.active.deepthink,
+                search_enabled: self.active.search,
+            },
         });
     }
 
-    fn messages_push(&mut self, message: (&'static str, String)) {
+    fn messages_push(&mut self, message: ChatMessage) {
         self.active.messages.push(message);
     }
 
@@ -384,27 +440,39 @@ impl FireCodeApp {
         while let Ok(event) = self.event_rx.try_recv() {
             repaint = true;
             match event {
-                ChatEvent::Delta { text } => {
-                    self.streaming_text = Some(text);
+                ChatEvent::Delta(streaming) => {
+                    self.streaming = Some(streaming);
                 }
                 ChatEvent::Finished {
                     result,
                     last_message_id,
                 } => {
                     self.busy = false;
-                    let text = self.streaming_text.take().unwrap_or_default();
+                    let streaming = self.streaming.take().unwrap_or_default();
                     match result {
                         Ok(()) => {
                             if let Some(id) = last_message_id {
                                 self.active.last_message_id = Some(id);
                             }
-                            self.messages_push(("assistant", text));
+                            self.messages_push(ChatMessage {
+                                role: "assistant",
+                                thinking: streaming.thinking,
+                                text: streaming.text,
+                            });
                         }
                         Err(e) => {
-                            if !text.is_empty() {
-                                self.messages_push(("assistant", text));
+                            if !streaming.text.is_empty() {
+                                self.messages_push(ChatMessage {
+                                    role: "assistant",
+                                    thinking: streaming.thinking,
+                                    text: streaming.text,
+                                });
                             }
-                            self.messages_push(("error", e));
+                            self.messages_push(ChatMessage {
+                                role: "error",
+                                thinking: None,
+                                text: e,
+                            });
                         }
                     }
                 }
@@ -415,14 +483,12 @@ impl FireCodeApp {
                         .messages
                         .iter()
                         .rev()
-                        .find(|(role, _)| *role == "user")
-                        .map(|(_, text)| text.chars().take(40).collect::<String>())
+                        .find(|m| m.role == "user")
+                        .map(|m| m.text.chars().take(40).collect::<String>())
                         .unwrap_or_else(|| "New chat".to_owned());
                     self.active.title = title.clone();
-                    self.sessions.insert(
-                        0,
-                        deepseek::SessionInfo { id, title },
-                    );
+                    self.sessions
+                        .insert(0, deepseek::SessionInfo { id, title });
                 }
                 ChatEvent::TitleSet { session_id, title } => {
                     if self.active.id.as_deref() == Some(session_id.as_str()) {
@@ -445,7 +511,11 @@ impl FireCodeApp {
                 }
                 ChatEvent::SessionsLoaded { result } => match result {
                     Ok(sessions) => self.sessions = sessions,
-                    Err(e) => self.messages_push(("error", format!("session list: {e}"))),
+                    Err(e) => self.messages_push(ChatMessage {
+                        role: "error",
+                        thinking: None,
+                        text: format!("session list: {e}"),
+                    }),
                 },
             }
         }
@@ -614,6 +684,21 @@ impl eframe::App for FireCodeApp {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong(&self.active.title);
+                    ui.separator();
+                    let think_btn = egui::Button::selectable(
+                        self.active.deepthink,
+                        egui::RichText::new("🧠 DeepThink"),
+                    );
+                    if ui.add_enabled(!self.busy, think_btn).clicked() {
+                        self.toggle_active(0);
+                    }
+                    let search_btn = egui::Button::selectable(
+                        self.active.search,
+                        egui::RichText::new("🔎 Search"),
+                    );
+                    if ui.add_enabled(!self.busy, search_btn).clicked() {
+                        self.toggle_active(1);
+                    }
                     if self.busy {
                         ui.spinner();
                     }
@@ -631,34 +716,52 @@ impl eframe::App for FireCodeApp {
                                 "Select a chat on the left or start a new one.",
                             );
                         }
-                        for (role, text) in &self.active.messages {
-                            match *role {
+                        for (mi, message) in self.active.messages.iter().enumerate() {
+                            match message.role {
                                 "user" => {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.strong("You:");
-                                        ui.label(text);
+                                        ui.label(&message.text);
                                     });
                                 }
                                 "assistant" => {
+                                    ui.strong("AI:");
+                                    if let Some(thinking) = &message.thinking {
+                                        egui::CollapsingHeader::new("🧠 Thinking")
+                                            .id_salt(("thinking_header", mi))
+                                            .default_open(false)
+                                            .show(ui, |ui| {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.weak(thinking.clone());
+                                                });
+                                            });
+                                    }
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.strong("AI:");
-                                        ui.label(text);
+                                        ui.label(&message.text);
                                     });
                                 }
                                 _ => {
-                                    ui.colored_label(egui::Color32::RED, format!("error: {text}"));
+                                    ui.colored_label(
+                                        egui::Color32::RED,
+                                        format!("error: {}", message.text),
+                                    );
                                 }
                             }
                             ui.add_space(2.0);
                         }
-                        if let Some(partial) = &self.streaming_text {
+                        if let Some(streaming) = &self.streaming {
+                            ui.strong("AI:");
+                            if let Some(thinking) = &streaming.thinking {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.weak(format!("🧠 {thinking}\u{258c}"));
+                                });
+                            }
                             ui.horizontal_wrapped(|ui| {
-                                ui.strong("AI:");
-                                if partial.is_empty() {
+                                if streaming.text.is_empty() && streaming.thinking.is_none() {
                                     ui.spinner();
                                     ui.label("waiting for stream...");
                                 } else {
-                                    ui.label(format!("{partial}\u{258c}"));
+                                    ui.label(format!("{}\u{258c}", streaming.text));
                                 }
                             });
                         }
