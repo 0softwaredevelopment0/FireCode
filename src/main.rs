@@ -75,7 +75,7 @@ enum ChatEvent {
         result: Result<Vec<deepseek::SessionInfo>, String>,
     },
     CommandStarted { cmd: String },
-    CommandFinished { cmd: String, output: agent::CommandOutput },
+    CommandFinished { cmd: String },
     AgentMessage { role: &'static str, text: String },
 }
 
@@ -245,10 +245,7 @@ fn spawn_worker(
                                     };
                                     send(
                                         &event_tx,
-                                        ChatEvent::CommandFinished {
-                                            cmd: cmd.clone(),
-                                            output: output.clone(),
-                                        },
+                                        ChatEvent::CommandFinished { cmd: cmd.clone() },
                                     );
                                     results.push((cmd.clone(), output));
                                 }
@@ -584,9 +581,10 @@ fn markdown_blocks_ui(
 }
 
 /// Command execution output: full-width window (always stretched to the
-/// right edge, adaptive on resize) with a clickable header row. Collapsed
-/// by default to a 10-row scrollable preview (mouse wheel or scrollbar);
-/// clicking the header toggles the full output.
+/// right edge, adaptive on resize) with a clickable header button. Collapsed
+/// by default to a 20-row scrollable preview (mouse wheel or scrollbar);
+/// clicking the header toggles the full output. An empty body renders the
+/// header button only (no frame).
 fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) {
     let expanded = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(id, false));
 
@@ -603,16 +601,18 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
             .y
     });
 
-    // full-width clickable header row: triangle + command text
-    let header_h = ui
-        .style()
-        .spacing
-        .interact_size
-        .y
-        .max(row_h * 1.3);
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), header_h),
-        egui::Sense::click(),
+    // full-width clickable header button: triangle + command text
+    let tri = if expanded { "▾" } else { "▸" };
+    let response = ui.add(
+        egui::Button::new(
+            egui::RichText::new(format!("{tri} {header}"))
+                .monospace()
+                .color(egui::Color32::from_rgb(225, 225, 230)),
+        )
+        .min_size(egui::vec2(
+            ui.available_width(),
+            ui.style().spacing.interact_size.y.max(row_h * 1.3),
+        )),
     );
     if response.clicked() {
         ui.memory_mut(|mem| {
@@ -620,45 +620,27 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
             *flag = !*flag;
         });
     }
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    ui.painter().rect_filled(
-        rect,
-        4,
-        if response.hovered() {
-            egui::Color32::from_rgb(48, 48, 55)
-        } else {
-            egui::Color32::from_rgb(38, 38, 44)
-        },
-    );
-    let tri = if expanded { "▾" } else { "▸" };
-    ui.painter().text(
-        rect.left_center() + egui::vec2(6.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        format!("{tri} {header}"),
-        egui::FontId::monospace(mono_size),
-        egui::Color32::from_rgb(225, 225, 230),
-    );
 
-    egui::Frame::default()
-        .fill(egui::Color32::from_rgb(30, 30, 34))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 76)))
-        .corner_radius(6)
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            ui.allocate_space(egui::vec2(ui.available_width(), 0.0));
-            if expanded {
-                ui.monospace(body);
-            } else {
-                egui::ScrollArea::vertical()
-                    .id_salt(id.with("scroll"))
-                    .max_height(row_h * 10.0)
-                    .show(ui, |ui| {
-                        ui.monospace(body);
-                    });
-            }
-        });
+    if !body.is_empty() {
+        egui::Frame::default()
+            .fill(egui::Color32::from_rgb(30, 30, 34))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 76)))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.allocate_space(egui::vec2(ui.available_width(), 0.0));
+                if expanded {
+                    ui.monospace(body);
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt(id.with("scroll"))
+                        .max_height(row_h * 20.0)
+                        .show(ui, |ui| {
+                            ui.monospace(body);
+                        });
+                }
+            });
+    }
     ui.add_space(2.0);
 }
 
@@ -1072,15 +1054,10 @@ impl FireCodeApp {
                     });
                     self.running_command_index = Some(self.active.messages.len() - 1);
                 }
-                ChatEvent::CommandFinished { cmd, output } => {
-                    let text = format!(
-                        "$ {cmd}\n{}",
-                        if output.output.trim().is_empty() {
-                            "(no output)".to_owned()
-                        } else {
-                            output.output.trim_end().to_owned()
-                        }
-                    );
+                ChatEvent::CommandFinished { cmd } => {
+                    // the window stays "just the command": the output is shown
+                    // by the following feedback message, not duplicated here
+                    let text = format!("$ {cmd}");
                     if let Some(idx) = self.running_command_index {
                         if let Some(msg) = self.active.messages.get_mut(idx) {
                             msg.text = text;
