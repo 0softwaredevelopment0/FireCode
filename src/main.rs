@@ -671,11 +671,14 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
                         if expanded {
                             ui.monospace(body);
                         } else {
+                            // fixed-height preview: ~10 real lines whether
+                            // the output is shorter (padded) or longer
+                            // (scrollable)
                             egui::ScrollArea::vertical()
                                 .id_salt(id.with("scroll"))
-                                .auto_shrink([false, true])
                                 .max_height(row_h * 20.0)
                                 .show(ui, |ui| {
+                                    ui.set_min_height(row_h * 20.0);
                                     ui.monospace(body);
                                 });
                         }
