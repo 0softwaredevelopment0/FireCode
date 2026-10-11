@@ -685,7 +685,10 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
                         .monospace()
                         .color(egui::Color32::from_rgb(225, 225, 230)),
                 )
-                .wrap_mode(egui::TextWrapMode::Extend),
+                // truncate (not extend): a longer-than-window header must
+                // not widen the chat content - that was shifting every
+                // wrapped line left and making it unreadable
+                .wrap_mode(egui::TextWrapMode::Truncate),
             );
 
             if !body.is_empty() {
