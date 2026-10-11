@@ -580,6 +580,37 @@ impl eframe::App for FireCodeApp {
                     });
                 });
 
+            egui::Panel::bottom("input_panel").show(ui, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let input_width = (ui.available_width() - 90.0).max(120.0);
+                    let response = ui.add_sized(
+                        [input_width, 22.0],
+                        egui::TextEdit::singleline(&mut self.input)
+                            .hint_text("Type a message... (Enter to send)")
+                            .id_salt("chat_input"),
+                    );
+                    let enter_pressed =
+                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let can_send = !self.busy
+                        && !self.input.trim().is_empty()
+                        && self.cmd_tx.is_some();
+                    let send_clicked = ui
+                        .add_enabled(can_send, egui::Button::new("Send"))
+                        .clicked();
+                    if (send_clicked || enter_pressed) && can_send {
+                        self.send_message();
+                        response.request_focus();
+                    }
+                });
+                if self.cmd_tx.is_none() {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "No valid token for the default site - chat is disabled.",
+                    );
+                }
+            });
+
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong(&self.active.title);
@@ -590,6 +621,7 @@ impl eframe::App for FireCodeApp {
                 ui.separator();
 
                 egui::ScrollArea::vertical()
+                    .auto_shrink(false)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.add_space(4.0);
@@ -632,35 +664,6 @@ impl eframe::App for FireCodeApp {
                         }
                         ui.add_space(8.0);
                     });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let input_width = (ui.available_width() - 90.0).max(120.0);
-                    let response = ui.add_sized(
-                        [input_width, 22.0],
-                        egui::TextEdit::singleline(&mut self.input)
-                            .hint_text("Type a message... (Enter to send)")
-                            .id_salt("chat_input"),
-                    );
-                    let enter_pressed =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let can_send = !self.busy
-                        && !self.input.trim().is_empty()
-                        && self.cmd_tx.is_some();
-                    let send_clicked = ui
-                        .add_enabled(can_send, egui::Button::new("Send"))
-                        .clicked();
-                    if (send_clicked || enter_pressed) && can_send {
-                        self.send_message();
-                        response.request_focus();
-                    }
-                });
-                if self.cmd_tx.is_none() {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        "No valid token for the default site - chat is disabled.",
-                    );
-                }
             });
         });
     }
