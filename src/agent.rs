@@ -193,7 +193,22 @@ pub fn agents_md_path() -> Result<PathBuf> {
         .join("AGENTS.md"))
 }
 
-pub const DEFAULT_AGENTS_MD: &str = r#"# FireCode agent instructions
+/// Loads the user-owned AGENTS.md next to the exe, if present.
+/// Missing file is not an error - the include option simply adds nothing.
+pub fn load_agents_md_opt() -> Option<String> {
+    let path = agents_md_path().ok()?;
+    std::fs::read_to_string(path).ok()
+}
+
+pub fn prompt_md_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot locate current exe")?;
+    Ok(exe
+        .parent()
+        .context("exe has no parent directory")?
+        .join("PROMPT.md"))
+}
+
+pub const DEFAULT_PROMPT_MD: &str = r#"# FireCode agent instructions
 
 You are a coding agent working inside FireCode, a desktop client that talks to
 you through this chat. FireCode can execute terminal commands on the user's PC
@@ -213,21 +228,25 @@ Rules:
 - Commands must be non-interactive: never ask for input, use flags like
   `-y` / `--yes`. Prefer PowerShell syntax (`;` instead of `&&`).
 - After all commands finish you receive their results as a feedback message:
-  `Command "<command>":` followed by the captured output (long output is
-  truncated). Analyze it, then either send more commands, continue your answer,
-  or finish.
+  `Command "cmd":` followed by the captured output (long output is
+  truncated). That feedback triggers you again automatically, so you do NOT
+  need `<continue>` alongside commands - if a message has both, the commands
+  run and the `<continue>` is simply ignored.
 - Keep the number of commands small and purposeful. Do not run destructive
   commands (deleting files, force pushes) unless the user explicitly asked.
 
 ## Tool 2: continue
 
-If your message got cut off or you have more to say but no commands to run,
-end the message with a single line:
+Every user request is just an information output task, and one response may
+not fit everything: if you have NOT finished what the user asked for - you
+stopped mid-sentence, still owe part of the answer, or the task needs more
+steps - end your message with a single line:
 
 <continue>
 
 FireCode will automatically send you "Continue" so you can pick up where you
-stopped. `<continue>` and `<command:...>` must not be used in the same message.
+stopped. Use `<continue>` whenever your answer is incomplete, not only when
+you visibly "stopped on something".
 
 ## General
 
@@ -235,17 +254,17 @@ stopped. `<continue>` and `<command:...>` must not be used in the same message.
 - Write commands exactly in the syntax shown - they are parsed line-by-line.
 "#;
 
-pub fn ensure_agents_md() -> Result<PathBuf> {
-    let path = agents_md_path()?;
+pub fn ensure_prompt_md() -> Result<PathBuf> {
+    let path = prompt_md_path()?;
     if !path.exists() {
-        std::fs::write(&path, DEFAULT_AGENTS_MD)
+        std::fs::write(&path, DEFAULT_PROMPT_MD)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(path)
 }
 
-pub fn load_agents_md() -> Result<String> {
-    let path = ensure_agents_md()?;
+pub fn load_prompt_md() -> Result<String> {
+    let path = ensure_prompt_md()?;
     std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
 }
 
@@ -338,6 +357,14 @@ mod tests {
         let feedback = build_feedback(&results);
         assert!(feedback.contains("Command \"echo\":\n(no output)"));
         assert!(feedback.contains("Command \"slow\":\n(no output)\n(did not exit)\n(timed out)"));
+    }
+
+    #[test]
+    fn parse_commands_and_continue_together() {
+        let parsed = parse_response("<command:\"git status\">\ntext\n<continue>");
+        assert_eq!(parsed.commands, vec!["git status".to_owned()]);
+        assert!(parsed.continue_next);
+        assert_eq!(parsed.text, "text");
     }
 
     #[test]

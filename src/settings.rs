@@ -56,6 +56,10 @@ impl BrowserPreset {
 pub struct AgentSettings {
     #[serde(default)]
     pub allow_sudo: bool,
+    /// Prepend AGENTS.md (from the exe directory, if present) to every
+    /// outgoing user message.
+    #[serde(default)]
+    pub include_agents_md: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -118,7 +122,10 @@ mod tests {
     #[test]
     fn settings_round_trip() {
         let settings = Settings {
-            agent: AgentSettings { allow_sudo: true },
+            agent: AgentSettings {
+                allow_sudo: true,
+                include_agents_md: true,
+            },
             browser: BrowserSettings {
                 preset: BrowserPreset::Chrome,
             },
@@ -126,6 +133,7 @@ mod tests {
         let raw = toml::to_string_pretty(&settings).expect("serialize");
         let parsed: Settings = toml::from_str(&raw).expect("parse");
         assert!(parsed.agent.allow_sudo);
+        assert!(parsed.agent.include_agents_md);
         assert_eq!(parsed.browser.preset, BrowserPreset::Chrome);
     }
 

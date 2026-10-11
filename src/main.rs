@@ -216,6 +216,8 @@ fn spawn_worker(
                             }
 
                             let parsed = parsed.expect("parsed in agent mode");
+                            // Commands and <continue> may share a message: commands win,
+                            // their feedback output re-triggers the agent on its own.
                             if !parsed.commands.is_empty() {
                                 let mut results = Vec::new();
                                 for cmd in &parsed.commands {
@@ -608,8 +610,8 @@ impl FireCodeApp {
             .preset(&config.default_preset)
             .map(|p| p.thinking_enabled)
             .unwrap_or(false);
-        if let Err(e) = agent::ensure_agents_md() {
-            eprintln!("AGENTS.md: {e:#}");
+        if let Err(e) = agent::ensure_prompt_md() {
+            eprintln!("PROMPT.md: {e:#}");
         }
         let settings = settings::load_or_create().unwrap_or_else(|e| {
             eprintln!("settings: {e:#}");
@@ -808,19 +810,19 @@ impl FireCodeApp {
         if self.busy {
             return;
         }
-        let content = match agent::load_agents_md() {
+        let content = match agent::load_prompt_md() {
             Ok(c) => c,
             Err(e) => {
                 self.messages_push(ChatMessage {
                     role: "error",
                     thinking: None,
-                    text: format!("AGENTS.md: {e:#}"),
+                    text: format!("PROMPT.md: {e:#}"),
                 });
                 return;
             }
         };
         let chars = content.chars().count();
-        self.dispatch_prompt(content, Some(format!("(AGENTS.md, {chars} chars)")));
+        self.dispatch_prompt(content, Some(format!("(PROMPT.md, {chars} chars)")));
     }
 
     fn dispatch_prompt(&mut self, text: String, display_text: Option<String>) {
@@ -838,6 +840,16 @@ impl FireCodeApp {
             thinking: None,
             text: display,
         });
+        // Include AGENTS.md is re-checked on every send.
+        let text = match (
+            self.settings.agent.include_agents_md,
+            agent::load_agents_md_opt(),
+        ) {
+            (true, Some(instructions)) => {
+                format!("Project instructions (AGENTS.md):\n{instructions}\n\nUser message:\n{text}")
+            }
+            _ => text,
+        };
         self.streaming = Some(StreamingAnswer::default());
         self.busy = true;
         let _ = cmd_tx.send(WorkerCommand::Prompt {
@@ -1203,6 +1215,11 @@ impl eframe::App for FireCodeApp {
                             "Allow sudo commands",
                         );
                         ui.weak("When off, sudo commands are blocked and the agent is told so in feedback.");
+                        ui.checkbox(
+                            &mut self.settings_draft.agent.include_agents_md,
+                            "Include AGENTS.md",
+                        );
+                        ui.weak("When on, AGENTS.md from the exe directory is prepended to every message (checked on each send).");
                         ui.add_space(6.0);
                         ui.separator();
                         ui.strong("Browser (token source)");
