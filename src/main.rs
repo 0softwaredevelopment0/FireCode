@@ -1567,7 +1567,11 @@ impl eframe::App for FireCodeApp {
                 });
                 ui.separator();
 
-                egui::ScrollArea::vertical()
+                // both directions: the horizontal scrollbar sits at the
+                // bottom of the chat area, right above the input panel,
+                // and pans the chat left/right when content is wider
+                // than the viewport
+                egui::ScrollArea::both()
                     .id_salt("chat_scroll")
                     .auto_shrink(false)
                     .stick_to_bottom(self.busy)
