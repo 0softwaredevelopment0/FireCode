@@ -582,9 +582,9 @@ fn markdown_blocks_ui(
 
 /// Command execution output: ONE window - a single dark frame containing
 /// the clickable header row (triangle + command, dark fill, lighter on
-/// hover) and the body below it. Collapsed by default to a 10-row
-/// scrollable preview (mouse wheel or scrollbar); clicking the header row
-/// toggles the full output. An empty body renders the header row only.
+/// hover) and the body below it. Collapsed by default to a scrollable
+/// preview (mouse wheel or scrollbar); clicking the header row toggles the
+/// full output. An empty body renders the header row only.
 fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) {
     let expanded = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(id, false));
 
@@ -674,7 +674,7 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
                             egui::ScrollArea::vertical()
                                 .id_salt(id.with("scroll"))
                                 .auto_shrink([false, true])
-                                .max_height(row_h * 10.0)
+                                .max_height(row_h * 20.0)
                                 .show(ui, |ui| {
                                     ui.monospace(body);
                                 });
