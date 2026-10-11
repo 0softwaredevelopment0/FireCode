@@ -503,39 +503,37 @@ fn markdown_blocks_ui(
                     .len()
                     .max(rows.iter().map(|r| r.len()).max().unwrap_or(0))
                     .max(1);
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    egui::Grid::new(egui::Id::new((id_salt, bi)))
-                        .striped(true)
-                        .num_columns(cols)
-                        .spacing([16.0, 4.0])
-                        .show(ui, |ui| {
-                            for cell in header {
+                egui::Grid::new(egui::Id::new((id_salt, bi)))
+                    .striped(true)
+                    .num_columns(cols)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        for cell in header {
+                            let job = spans_to_job(
+                                ui,
+                                &markdown::parse_inline(cell),
+                                body,
+                                true,
+                                true,
+                            );
+                            ui.label(job);
+                        }
+                        ui.end_row();
+                        for row in rows {
+                            for ci in 0..cols {
+                                let cell = row.get(ci).map(String::as_str).unwrap_or("");
                                 let job = spans_to_job(
                                     ui,
                                     &markdown::parse_inline(cell),
                                     body,
-                                    true,
-                                    true,
+                                    false,
+                                    false,
                                 );
                                 ui.label(job);
                             }
                             ui.end_row();
-                            for row in rows {
-                                for ci in 0..cols {
-                                    let cell = row.get(ci).map(String::as_str).unwrap_or("");
-                                    let job = spans_to_job(
-                                        ui,
-                                        &markdown::parse_inline(cell),
-                                        body,
-                                        false,
-                                        false,
-                                    );
-                                    ui.label(job);
-                                }
-                                ui.end_row();
-                            }
-                        });
-                });
+                        }
+                    });
                 ui.add_space(4.0);
             }
             Block::Code { lang, code, closed } => code_block_ui(
@@ -587,7 +585,7 @@ fn code_block_ui(
                 }
             });
             ui.add_space(2.0);
-            egui::ScrollArea::horizontal().show(ui, |ui| {
+            egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(code.trim_end_matches('\n'))
@@ -1134,7 +1132,7 @@ impl eframe::App for FireCodeApp {
                             self.settings_open = true;
                         }
                     });
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("sessions_scroll").show(ui, |ui| {
                         let active_id = self.active.id.clone();
                         let mut open_request: Option<(String, String)> = None;
                         if self.sessions.is_empty() && !self.busy {
@@ -1328,8 +1326,9 @@ impl eframe::App for FireCodeApp {
                 ui.separator();
 
                 egui::ScrollArea::vertical()
+                    .id_salt("chat_scroll")
                     .auto_shrink(false)
-                    .stick_to_bottom(true)
+                    .stick_to_bottom(self.busy)
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
                         ui.add_space(4.0);

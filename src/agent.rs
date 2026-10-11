@@ -45,15 +45,23 @@ fn unescape_command_string(raw: &str) -> String {
 /// `<command-header>` / `<string:"...">` (or `<string:'...'>`) /
 /// `<command-footer>` blocks and a trailing `<continue>` marker from a
 /// response. Anything else stays in `text`. A multiline block runs as one
-/// command (lines joined with `\n`).
+/// command (lines joined with `\n`). Lines inside ``` fenced code blocks
+/// are never treated as commands or markers - fences shield documentation.
 pub fn parse_response(raw: &str) -> ParsedResponse {
     let mut text = String::new();
     let mut commands = Vec::new();
     let mut continue_next = false;
     let mut multi: Option<Vec<String>> = None;
+    let mut in_fence = false;
 
     let flush_multi = |multi: &mut Option<Vec<String>>, commands: &mut Vec<String>| {
-        if let Some(block) = multi.take() {
+        if let Some(mut block) = multi.take() {
+            while block.first().is_some_and(|line| line.is_empty()) {
+                block.remove(0);
+            }
+            while block.last().is_some_and(|line| line.is_empty()) {
+                block.pop();
+            }
             let joined = block.join("\n");
             if !joined.trim().is_empty() {
                 commands.push(joined);
@@ -63,6 +71,17 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
 
     for line in raw.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            text.push_str(line);
+            text.push('\n');
+            continue;
+        }
+        if in_fence {
+            text.push_str(line);
+            text.push('\n');
+            continue;
+        }
         if multi.is_some() {
             // a new header always starts a new command, even if the previous
             // block missed its footer - blocks can never merge this way
@@ -117,21 +136,22 @@ fn extract_single_command(trimmed: &str) -> Option<String> {
 }
 
 /// Extracts one `<string:...>` line: the double-quoted form unescapes,
-/// the single-quoted form is raw (free `"` embedding). Empty lines yield None.
+/// the single-quoted form is raw (free `"` embedding). Content is kept
+/// exactly (indentation matters for files); empty lines are kept too so
+/// blank lines survive - only a fully empty block is dropped at flush.
+/// Returns None when the line is not a string line at all.
 fn extract_string_line(trimmed: &str) -> Option<String> {
     if let Some(inner) = trimmed
         .strip_prefix("<string:\"")
         .and_then(|rest| rest.strip_suffix("\">"))
     {
-        let cmd = unescape_command_string(inner.trim());
-        return if cmd.is_empty() { None } else { Some(cmd) };
+        return Some(unescape_command_string(inner));
     }
     if let Some(inner) = trimmed
         .strip_prefix("<string:'")
         .and_then(|rest| rest.strip_suffix("'>"))
     {
-        let cmd = inner.trim().to_owned();
-        return if cmd.is_empty() { None } else { Some(cmd) };
+        return Some(inner.to_owned());
     }
     None
 }
@@ -367,6 +387,13 @@ For quote-heavy content use the single-quoted form - no processing inside,
 
 <string:'Write-Host "hi"'>
 
+### Fences and blank lines
+
+Empty `<string:"">` lines are kept, so blank lines survive in generated
+files; leading spaces are preserved exactly. Lines inside ``` fenced code
+blocks are never treated as commands or markers - use fences when showing
+syntax examples.
+
 ## Tool 2: continue
 
 Every user request is just an information output task, and one response may
@@ -414,6 +441,14 @@ pub fn ensure_prompt_md() -> Result<PathBuf> {
         updated.push_str(&quoting_docs_section());
         changed = true;
     }
+    // fence shielding and blank-line preservation came later still
+    if !updated.contains("Fences and blank lines") {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&fences_docs_section());
+        changed = true;
+    }
     if changed {
         std::fs::write(&path, updated)
             .with_context(|| format!("failed to write {}", path.display()))?;
@@ -452,6 +487,17 @@ For quote-heavy content use the single-quoted form - no processing inside,
 `"` embeds freely:
 
 <string:'Write-Host "hi"'>
+"#
+}
+
+fn fences_docs_section() -> &'static str {
+    r#"
+### Fences and blank lines
+
+Empty `<string:"">` lines are kept, so blank lines survive in generated
+files; leading spaces are preserved exactly. Lines inside ``` fenced code
+blocks are never treated as commands or markers - use fences when showing
+syntax examples.
 "#
 }
 
@@ -601,6 +647,23 @@ mod tests {
             parsed.commands,
             vec!["echo a".to_owned(), "git status".to_owned()]
         );
+    }
+
+    #[test]
+    fn parse_block_keeps_blank_lines_and_indentation() {
+        let raw = "<command-header>\n<string:\"line1\">\n<string:\"\">\n<string:\"    indented\">\n<command-footer>";
+        let parsed = parse_response(raw);
+        assert_eq!(parsed.commands, vec!["line1\n\n    indented".to_owned()]);
+    }
+
+    #[test]
+    fn parse_fenced_markers_stay_text() {
+        let raw = "text\n```\n<command:\"x\">\n<continue>\n```\nafter";
+        let parsed = parse_response(raw);
+        assert!(parsed.commands.is_empty());
+        assert!(!parsed.continue_next);
+        assert!(parsed.text.contains("<command:\"x\">"));
+        assert!(parsed.text.contains("<continue>"));
     }
 
     #[test]
