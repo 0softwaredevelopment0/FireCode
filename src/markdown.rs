@@ -14,6 +14,10 @@ pub enum Block {
         /// False while the closing fence has not arrived (live streaming).
         closed: bool,
     },
+    Table {
+        header: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
     Paragraph(String),
 }
 
@@ -28,6 +32,8 @@ pub enum InlineSpan {
 pub fn parse_blocks(input: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut paragraph: Vec<String> = Vec::new();
+    let lines: Vec<&str> = input.lines().collect();
+    let mut li = 0;
 
     let flush_paragraph = |paragraph: &mut Vec<String>, blocks: &mut Vec<Block>| {
         if !paragraph.is_empty() {
@@ -40,8 +46,11 @@ pub fn parse_blocks(input: &str) -> Vec<Block> {
     let mut code = String::new();
     let mut lang = String::new();
 
-    for line in input.lines() {
+    while li < lines.len() {
+        let line = lines[li];
         let trimmed = line.trim_start();
+        li += 1;
+
         if !in_code && trimmed.starts_with("```") {
             flush_paragraph(&mut paragraph, &mut blocks);
             in_code = true;
@@ -61,6 +70,20 @@ pub fn parse_blocks(input: &str) -> Vec<Block> {
                 code.push_str(line);
                 code.push('\n');
             }
+            continue;
+        }
+
+        // GFM table: a row line whose next line is a |---|---| separator.
+        if trimmed.starts_with('|') && li < lines.len() && is_table_separator(lines[li].trim()) {
+            flush_paragraph(&mut paragraph, &mut blocks);
+            li += 1; // skip separator
+            let header = parse_table_row(trimmed);
+            let mut rows = Vec::new();
+            while li < lines.len() && lines[li].trim_start().starts_with('|') {
+                rows.push(parse_table_row(lines[li].trim()));
+                li += 1;
+            }
+            blocks.push(Block::Table { header, rows });
             continue;
         }
 
@@ -105,6 +128,32 @@ pub fn parse_blocks(input: &str) -> Vec<Block> {
         flush_paragraph(&mut paragraph, &mut blocks);
     }
     blocks
+}
+
+/// `| a | b |` -> ["a", "b"]; outer pipes optional, cells trimmed.
+fn parse_table_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_owned()).collect()
+}
+
+/// `|---|:---:|` -> true. Cells may contain only dashes and colons.
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    if !t.contains('-') {
+        return false;
+    }
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|')
+        .all(|cell| {
+            let cell = cell.trim();
+            !cell.is_empty()
+                && cell
+                    .bytes()
+                    .all(|b| b == b'-' || b == b':' || b == b' ')
+        })
 }
 
 fn heading_level(line: &str) -> u8 {
@@ -218,6 +267,7 @@ mod tests {
                 Block::BulletItem(_) => "bullet".to_owned(),
                 Block::OrderedItem { .. } => "ordered".to_owned(),
                 Block::Code { .. } => "code".to_owned(),
+                Block::Table { .. } => "table".to_owned(),
                 Block::Paragraph(_) => "paragraph".to_owned(),
             })
             .collect()
@@ -321,5 +371,48 @@ mod tests {
     fn empty_bold_stays_literal() {
         let spans = parse_inline("x **** y");
         assert_eq!(spans, vec![InlineSpan::Plain("x **** y".to_owned())]);
+    }
+
+    #[test]
+    fn gfm_table_parses() {
+        let input = "| Клавиша | Действие |\n|---|---|\n| W | Вверх |\n| S | Вниз |\n\nпосле";
+        let blocks = parse_blocks(input);
+        assert_eq!(
+            kinds(&blocks),
+            vec!["table", "paragraph"]
+        );
+        match &blocks[0] {
+            Block::Table { header, rows } => {
+                assert_eq!(header, &vec!["Клавиша".to_owned(), "Действие".to_owned()]);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], "W");
+                assert_eq!(rows[0][1], "Вверх");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn separator_variants_recognized() {
+        assert!(is_table_separator("|---|---|"));
+        assert!(is_table_separator("| :--- | :---: |"));
+        assert!(is_table_separator("--- | ---"));
+        assert!(!is_table_separator("| a | b |"));
+        assert!(!is_table_separator("| | |"));
+    }
+
+    #[test]
+    fn single_pipe_line_is_not_a_table() {
+        let blocks = parse_blocks("| просто текст |");
+        assert_eq!(kinds(&blocks), vec!["paragraph"]);
+    }
+
+    #[test]
+    fn table_row_splits_cells() {
+        assert_eq!(
+            parse_table_row("| a | b | c |"),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+        assert_eq!(parse_table_row("a | b"), vec!["a".to_owned(), "b".to_owned()]);
     }
 }

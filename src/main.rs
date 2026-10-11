@@ -324,6 +324,44 @@ fn markdown_blocks_ui(
                     ui.label(job);
                 });
             }
+            Block::Table { header, rows } => {
+                let cols = header
+                    .len()
+                    .max(rows.iter().map(|r| r.len()).max().unwrap_or(0))
+                    .max(1);
+                egui::Grid::new(egui::Id::new((id_salt, bi)))
+                    .striped(true)
+                    .num_columns(cols)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        for cell in header {
+                            let job = spans_to_job(
+                                ui,
+                                &markdown::parse_inline(cell),
+                                body,
+                                true,
+                                true,
+                            );
+                            ui.label(job);
+                        }
+                        ui.end_row();
+                        for row in rows {
+                            for ci in 0..cols {
+                                let cell = row.get(ci).map(String::as_str).unwrap_or("");
+                                let job = spans_to_job(
+                                    ui,
+                                    &markdown::parse_inline(cell),
+                                    body,
+                                    false,
+                                    false,
+                                );
+                                ui.label(job);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(4.0);
+            }
             Block::Code { lang, code, closed } => code_block_ui(
                 ui,
                 ctx,
