@@ -21,6 +21,31 @@ impl Token {
     }
 }
 
+/// Firefox localStorage values for chat.deepseek.com are JSON wrappers like
+/// `{"value": "..."}` (nested one more level in some keys) - unwrap them.
+fn unwrap_local_storage_value(value: String) -> String {
+    let mut current = value;
+    for _ in 0..2 {
+        if !current.starts_with('{') {
+            break;
+        }
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&current) else {
+            break;
+        };
+        match parsed.get("value") {
+            Some(serde_json::Value::String(inner)) => current = inner.clone(),
+            Some(serde_json::Value::Object(_)) => {
+                let Some(serde_json::Value::String(inner)) = parsed["value"].get("value") else {
+                    break;
+                };
+                current = inner.clone();
+            }
+            _ => break,
+        }
+    }
+    current
+}
+
 pub fn mask(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
     if chars.len() <= MASKED_PREFIX + MASKED_SUFFIX {
@@ -107,6 +132,7 @@ fn read_local_storage_token(profile_dir: &Path, db_rel: &str, key: &str) -> Resu
         };
 
         let _ = utf16_length;
+        let value = unwrap_local_storage_value(value.trim().to_owned());
         if value.trim().is_empty() {
             bail!("value of '{key}' is empty");
         }
@@ -123,9 +149,12 @@ fn read_local_storage_token(profile_dir: &Path, db_rel: &str, key: &str) -> Resu
 /// Copies the SQLite database (plus -wal/-shm sidecars) into a temporary
 /// directory so we can read it even while Firefox holds a lock on the original.
 fn snapshot_db(db_path: &Path) -> Result<PathBuf> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp_dir = std::env::temp_dir().join(format!(
-        "firecode_auth_{}",
-        std::process::id()
+        "firecode_auth_{}_{}",
+        std::process::id(),
+        seq
     ));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir)
@@ -166,6 +195,21 @@ mod tests {
         assert_eq!(decoded, "eyJhbGciOiJIUzQ");
     }
 
+    #[test]
+    fn unwrap_extracts_token_from_json_wrapper() {
+        assert_eq!(
+            unwrap_local_storage_value(r#"{"value":"B2abc123"}"#.to_owned()),
+            "B2abc123"
+        );
+        assert_eq!(unwrap_local_storage_value("rawtoken".to_owned()), "rawtoken");
+        assert_eq!(
+            unwrap_local_storage_value(
+                r#"{"value":{"orig":"inner"}}"#.to_owned()
+            ),
+            r#"{"value":{"orig":"inner"}}"#
+        );
+    }
+
     /// Verification against the real Firefox profile on this machine.
     /// Run explicitly: cargo test --release -- --ignored
     #[test]
@@ -178,5 +222,9 @@ mod tests {
         let token = read_token(Path::new(&profile), &site.token).expect("token read failed");
         println!("site '{}', key '{}': {}", config.default_site, token.key, token.masked());
         assert!(token.value.len() > 20);
+        assert!(
+            !token.value.starts_with('{'),
+            "token must be unwrapped from the localStorage JSON wrapper"
+        );
     }
 }

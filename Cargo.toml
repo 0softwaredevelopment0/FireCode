@@ -1,16 +1,18 @@
 [package]
 name = "firecode"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.23.1"
 directories = "6.0.0"
 eframe = "0.36.2"
 egui = "0.36.2"
+futures-util = "0.3.34"
 reqwest = { version = "0.13.5", features = ["json", "cookies", "stream", "gzip"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time"] }
 toml = "1.1.8"
