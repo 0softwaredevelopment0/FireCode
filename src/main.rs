@@ -671,16 +671,22 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
                         if expanded {
                             ui.monospace(body);
                         } else {
-                            // fixed-height preview: ~10 real lines whether
-                            // the output is shorter (padded) or longer
-                            // (scrollable)
-                            egui::ScrollArea::vertical()
-                                .id_salt(id.with("scroll"))
-                                .max_height(row_h * 20.0)
-                                .show(ui, |ui| {
-                                    ui.set_min_height(row_h * 20.0);
-                                    ui.monospace(body);
-                                });
+                            // fixed ~10-real-line preview at full width:
+                            // allocate_ui pins the viewport height (short
+                            // output is padded, long output scrolls) and
+                            // the scrollbar hugs the window's right edge
+                            let preview_h = row_h * 20.0;
+                            ui.allocate_ui(
+                                egui::vec2(ui.available_width(), preview_h),
+                                |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt(id.with("scroll"))
+                                        .max_height(preview_h)
+                                        .show(ui, |ui| {
+                                            ui.monospace(body);
+                                        });
+                                },
+                            );
                         }
                     });
             }
