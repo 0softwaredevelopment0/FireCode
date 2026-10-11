@@ -84,9 +84,14 @@ fn spawn_worker(
     token: String,
     agent_config: config::AgentConfig,
     workdir: std::path::PathBuf,
-) -> (Sender<WorkerCommand>, Receiver<ChatEvent>) {
+) -> (
+    Sender<WorkerCommand>,
+    Receiver<ChatEvent>,
+    Sender<()>,
+) {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WorkerCommand>();
     let (event_tx, event_rx) = std::sync::mpsc::channel::<ChatEvent>();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
@@ -176,6 +181,7 @@ fn spawn_worker(
                                 parent_message_id,
                                 &options,
                                 &event_tx,
+                                &stop_rx,
                             )
                             .await;
                             let (full_text, last_id) = match result {
@@ -316,7 +322,7 @@ fn spawn_worker(
         });
     });
 
-    (cmd_tx, event_rx)
+    (cmd_tx, event_rx, stop_tx)
 }
 #[allow(clippy::too_many_arguments)]
 async fn try_prompt(
@@ -326,34 +332,61 @@ async fn try_prompt(
     parent_message_id: Option<i64>,
     options: &deepseek::CompletionOptions,
     event_tx: &Sender<ChatEvent>,
+    stop_rx: &std::sync::mpsc::Receiver<()>,
 ) -> Result<(String, Option<i64>), anyhow::Error> {
+    // drop stop signals from previous phases - only a stop pressed during
+    // this stream cancels it
+    while stop_rx.try_recv().is_ok() {}
     let resp = client
         .completion(session_id, prompt, parent_message_id, options)
         .await?;
     let mut acc = deepseek::ResponseAccumulator::default();
+    let mut response_id: Option<i64> = None;
+    let mut stop_requested = false;
     let sid = session_id.to_owned();
     let tx = event_tx.clone();
-    let last = deepseek::pump_sse(resp, |event, payload| {
-        if event == "title" {
+    let last = deepseek::pump_sse(
+        resp,
+        |event, payload| {
+            if event == "title" {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                    if let Some(title) = v.get("content").and_then(|c| c.as_str()) {
+                        let _ = tx.send(ChatEvent::TitleSet {
+                            session_id: sid.clone(),
+                            title: title.to_owned(),
+                        });
+                    }
+                }
+                return;
+            }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
-                if let Some(title) = v.get("content").and_then(|c| c.as_str()) {
-                    let _ = tx.send(ChatEvent::TitleSet {
-                        session_id: sid.clone(),
-                        title: title.to_owned(),
-                    });
+                if let Some(id) = v.get("response_message_id").and_then(|i| i.as_i64()) {
+                    response_id = Some(id);
                 }
             }
-            return;
-        }
-        if acc.feed(payload) {
-            let a = acc.answer();
-            let _ = tx.send(ChatEvent::Delta(StreamingAnswer {
-                thinking: a.thinking,
-                text: a.text,
-            }));
-        }
-    })
+            if acc.feed(payload) {
+                let a = acc.answer();
+                let _ = tx.send(ChatEvent::Delta(StreamingAnswer {
+                    thinking: a.thinking,
+                    text: a.text,
+                }));
+            }
+        },
+        || {
+            if stop_rx.try_recv().is_ok() {
+                stop_requested = true;
+                true
+            } else {
+                false
+            }
+        },
+    )
     .await?;
+    if stop_requested {
+        if let Some(id) = response_id.or(last) {
+            let _ = client.stop_stream(session_id, id).await;
+        }
+    }
     Ok((acc.answer().text, last))
 }
 struct ActiveSession {
@@ -398,6 +431,7 @@ struct FireCodeApp {
     preset_selected: usize,
     event_rx: Receiver<ChatEvent>,
     cmd_tx: Option<Sender<WorkerCommand>>,
+    stop_tx: Option<Sender<()>>,
 }
 fn spans_to_job(
     ui: &mut egui::Ui,
@@ -647,6 +681,7 @@ impl FireCodeApp {
             preset_selected,
             event_rx: std::sync::mpsc::channel().1,
             cmd_tx: None,
+            stop_tx: None,
         };
         app.reread_tokens();
         if app.cmd_tx.is_some() {
@@ -695,7 +730,7 @@ impl FireCodeApp {
             (Some(token), Ok(site)) => {
                 let workdir =
                     agent::resolve_working_dir(&self.settings.agent.working_dir);
-                let (cmd_tx, event_rx) = spawn_worker(
+                let (cmd_tx, event_rx, stop_tx) = spawn_worker(
                     site.api_base.clone(),
                     token.clone(),
                     self.config.agent.clone(),
@@ -703,8 +738,12 @@ impl FireCodeApp {
                 );
                 self.cmd_tx = Some(cmd_tx);
                 self.event_rx = event_rx;
+                self.stop_tx = Some(stop_tx);
             }
-            _ => self.cmd_tx = None,
+            _ => {
+                self.cmd_tx = None;
+                self.stop_tx = None;
+            }
         }
     }
 
@@ -1208,12 +1247,31 @@ impl eframe::App for FireCodeApp {
                     let can_send = !self.busy
                         && !self.input.trim().is_empty()
                         && self.cmd_tx.is_some();
-                    let send_clicked = ui
-                        .add_enabled(can_send, egui::Button::new("Send"))
-                        .clicked();
-                    if (send_clicked || send_hotkey) && can_send {
-                        self.send_message();
-                        response.request_focus();
+                    if self.streaming.is_some() {
+                        if ui
+                            .add_sized(
+                                [72.0, 30.0],
+                                egui::Button::new(
+                                    egui::RichText::new("■ Stop").size(15.0),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            if let Some(stop_tx) = self.stop_tx.clone() {
+                                let _ = stop_tx.send(());
+                            }
+                        }
+                    } else {
+                        let send_clicked = ui
+                            .add_enabled(
+                                can_send,
+                                egui::Button::new(egui::RichText::new("▶ Send").size(15.0)),
+                            )
+                            .clicked();
+                        if (send_clicked || send_hotkey) && can_send {
+                            self.send_message();
+                            response.request_focus();
+                        }
                     }
                 });
                 if self.cmd_tx.is_none() {
@@ -1294,7 +1352,7 @@ impl eframe::App for FireCodeApp {
                     ui.separator();
                     let think_btn = egui::Button::selectable(
                         self.active.deepthink,
-                        egui::RichText::new("🧠 DeepThink"),
+                        egui::RichText::new("▶ DeepThink"),
                     );
                     if ui.add_enabled(!self.busy, think_btn).clicked() {
                         self.toggle_active(0);
@@ -1355,7 +1413,7 @@ impl eframe::App for FireCodeApp {
                                 "assistant" => {
                                     ui.strong("AI:");
                                     if let Some(thinking) = &message.thinking {
-                                        egui::CollapsingHeader::new("🧠 Thinking")
+                                        egui::CollapsingHeader::new("▶ Thinking")
                                             .id_salt(("thinking_header", mi))
                                             .default_open(false)
                                             .show(ui, |ui| {
@@ -1412,7 +1470,7 @@ impl eframe::App for FireCodeApp {
                             ui.strong("AI:");
                             if let Some(thinking) = &streaming.thinking {
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.weak(format!("🧠 {thinking}\u{258c}"));
+                                    ui.weak(format!("▶ {thinking}\u{258c}"));
                                 });
                             }
                             markdown_blocks_ui(

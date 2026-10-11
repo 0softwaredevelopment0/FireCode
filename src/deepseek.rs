@@ -144,6 +144,24 @@ impl DeepSeekClient {
         Ok(resp)
     }
 
+    /// Halts an in-flight assistant response server-side.
+    pub async fn stop_stream(&self, session_id: &str, message_id: i64) -> Result<()> {
+        let resp: ApiResponse = self
+            .post("/api/v0/chat/stop_stream")
+            .json(&serde_json::json!({
+                "chat_session_id": session_id,
+                "message_id": message_id,
+            }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.code != 0 {
+            bail!("chat/stop_stream failed: {} ({})", resp.msg, resp.code);
+        }
+        Ok(())
+    }
+
     /// Lists recent chats (the ones shown at chat.deepseek.com,
     /// share links like /a/chat/s/<uuid>).
     pub async fn list_sessions(&self, limit: u32) -> Result<Vec<SessionInfo>> {
@@ -448,11 +466,13 @@ pub struct HistoryMessage {
 }
 
 /// Splits an SSE byte stream into `(event_name, data_payload)` pairs and
-/// invokes `on_data` for every payload. Returns the `response_message_id`
-/// from the `ready` event, if seen.
-pub async fn pump_sse<F>(resp: reqwest::Response, mut on_data: F) -> Result<Option<i64>>
+/// invokes `on_data` for every payload. `should_stop` is polled on every
+/// chunk - a true return ends the stream early. Returns the
+/// `response_message_id` from the `ready` event, if seen.
+pub async fn pump_sse<F, S>(resp: reqwest::Response, mut on_data: F, mut should_stop: S) -> Result<Option<i64>>
 where
     F: FnMut(&str, &str),
+    S: FnMut() -> bool,
 {
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
@@ -465,6 +485,9 @@ where
             None => break,
         };
         buf.extend_from_slice(&chunk);
+        if should_stop() {
+            return Ok(response_message_id);
+        }
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=pos).collect();
             let mut line = String::from_utf8_lossy(&line).into_owned();
@@ -672,9 +695,13 @@ mod tests {
         );
 
         let mut acc = ResponseAccumulator::default();
-        let _ = pump_sse(resp, |_event, payload| {
-            acc.feed(payload);
-        })
+        let _ = pump_sse(
+            resp,
+            |_event, payload| {
+                acc.feed(payload);
+            },
+            || false,
+        )
         .await
         .expect("stream");
         println!("assistant: {:?}", acc.answer().text);
@@ -704,9 +731,13 @@ mod tests {
             .expect("completion");
 
         let mut acc = ResponseAccumulator::default();
-        let _ = pump_sse(resp, |_event, payload| {
-            acc.feed(payload);
-        })
+        let _ = pump_sse(
+            resp,
+            |_event, payload| {
+                acc.feed(payload);
+            },
+            || false,
+        )
         .await
         .expect("stream");
         let a = acc.answer();
