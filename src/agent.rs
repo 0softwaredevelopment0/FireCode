@@ -156,6 +156,37 @@ fn extract_string_line(trimmed: &str) -> Option<String> {
     None
 }
 
+/// Splits a feedback message (built by [`build_feedback`]) back into
+/// `(header, output)` blocks: a line like `Command "cmd":` opens a block,
+/// everything until the next such line (or EOF) is its output. Lines before
+/// the first header are dropped (build_feedback emits none).
+pub fn parse_feedback_blocks(text: &str) -> Vec<(String, String)> {
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = trimmed
+            .strip_prefix("Command \"")
+            .and_then(|rest| rest.strip_suffix("\":"))
+        {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+            current = Some((format!("Command \"{header}\":"), String::new()));
+            continue;
+        }
+        if let Some((_, body)) = current.as_mut() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(line);
+        }
+    }
+    if let Some(block) = current.take() {
+        blocks.push(block);
+    }
+    blocks
+}
 /// Builds the feedback message sent back to the chat after command
 /// execution: one `Command "...":` block per command.
 pub fn build_feedback(results: &[(String, CommandOutput)]) -> String {
@@ -545,6 +576,40 @@ mod tests {
         let parsed = parse_response("<command:no-quotes>\n<command:\"\">");
         assert!(parsed.commands.is_empty());
         assert!(parsed.text.contains("<command:no-quotes>"));
+    }
+
+    #[test]
+    fn feedback_blocks_round_trip() {
+        let results = vec![
+            (
+                "git status".to_owned(),
+                CommandOutput {
+                    output: "On main".to_owned(),
+                    exit_code: Some(0),
+                    timed_out: false,
+                },
+            ),
+            (
+                "cargo test".to_owned(),
+                CommandOutput {
+                    output: "line1\nline2".to_owned(),
+                    exit_code: Some(1),
+                    timed_out: false,
+                },
+            ),
+        ];
+        let feedback = build_feedback(&results);
+        let blocks = parse_feedback_blocks(&feedback);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "Command \"git status\":");
+        assert_eq!(blocks[0].1, "On main");
+        assert_eq!(blocks[1].0, "Command \"cargo test\":");
+        assert!(blocks[1].1.contains("line1\nline2"));
+    }
+
+    #[test]
+    fn feedback_blocks_empty_without_headers() {
+        assert!(parse_feedback_blocks("just text\nno headers").is_empty());
     }
 
     #[test]

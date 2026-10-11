@@ -583,19 +583,16 @@ fn markdown_blocks_ui(
     }
 }
 
-/// Command execution output: full-width window, 10 text rows tall with
-/// its own scrollbar, expandable to the full output via the chevron.
+/// Command execution output: full-width window (always stretched to the
+/// right edge, adaptive on resize), 20 text rows tall with its own
+/// scrollbar, expandable to the full output via the chevron.
 /// Keeps long outputs from flooding the chat.
-fn command_output_ui(ui: &mut egui::Ui, message_text: &str) {
-    let mut lines = message_text.lines();
-    let cmd_line = lines.next().unwrap_or("$").to_owned();
-    let output: String = lines.collect::<Vec<_>>().join("\n");
-
-    let state_id = egui::Id::new(("cmdexpand", cmd_line.clone()));
+fn command_output_ui(ui: &mut egui::Ui, header: &str, body: &str) {
+    let state_id = egui::Id::new(("cmdexpand", header));
     let expanded = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(state_id, false));
 
     ui.horizontal(|ui| {
-        ui.monospace(cmd_line.clone());
+        ui.monospace(header);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let label = if expanded { "▲ less" } else { "▼ more" };
             if ui.small_button(label).clicked() {
@@ -624,14 +621,15 @@ fn command_output_ui(ui: &mut egui::Ui, message_text: &str) {
         .corner_radius(6)
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            let area = egui::ScrollArea::vertical().id_salt(("cmdscroll", cmd_line));
+            ui.allocate_space(egui::vec2(ui.available_width(), 0.0));
+            let area = egui::ScrollArea::vertical().id_salt(("cmdscroll", header));
             let area = if expanded {
                 area
             } else {
-                area.max_height(row_h * 10.0)
+                area.max_height(row_h * 20.0)
             };
             area.show(ui, |ui| {
-                ui.monospace(output);
+                ui.monospace(body);
             });
         });
     ui.add_space(2.0);
@@ -1485,17 +1483,29 @@ impl eframe::App for FireCodeApp {
                                     );
                                 }
                                 "command" => {
-                                    command_output_ui(ui, &message.text);
+                                    let mut lines = message.text.lines();
+                                    let header = lines.next().unwrap_or("$");
+                                    let body: String =
+                                        lines.collect::<Vec<_>>().join("\n");
+                                    command_output_ui(ui, header, &body);
                                 }
                                 "feedback" => {
                                     ui.strong("⚙ Feedback:");
-                                    markdown_blocks_ui(
-                                        ui,
-                                        &ctx2,
-                                        &message.text,
-                                        format!("feedback{mi}").as_str(),
-                                        &mut self.copied_code,
-                                    );
+                                    let blocks =
+                                        agent::parse_feedback_blocks(&message.text);
+                                    if blocks.is_empty() {
+                                        markdown_blocks_ui(
+                                            ui,
+                                            &ctx2,
+                                            &message.text,
+                                            format!("feedback{mi}").as_str(),
+                                            &mut self.copied_code,
+                                        );
+                                    } else {
+                                        for (header, body) in &blocks {
+                                            command_output_ui(ui, header, body);
+                                        }
+                                    }
                                 }
                                 "prompt" => {
                                     ui.horizontal_wrapped(|ui| {
