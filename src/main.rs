@@ -7,6 +7,7 @@ mod deepseek;
 mod fonts;
 mod markdown;
 mod pow;
+mod settings;
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, Sender};
@@ -28,6 +29,7 @@ enum WorkerCommand {
         text: String,
         options: deepseek::CompletionOptions,
         agent: bool,
+        allow_sudo: bool,
     },
     LoadHistory {
         session_id: String,
@@ -119,6 +121,7 @@ fn spawn_worker(
                         text,
                         options,
                         agent,
+                        allow_sudo,
                     } => {
                         let mut session_id = session_id;
                         let mut parent_message_id = parent_message_id;
@@ -216,18 +219,21 @@ fn spawn_worker(
                                 let mut results = Vec::new();
                                 for cmd in &parsed.commands {
                                     send(&event_tx, ChatEvent::CommandStarted { cmd: cmd.clone() });
-                                    let output = agent::execute_command(
-                                        cmd,
-                                        &workdir,
-                                        shell,
-                                        timeout,
-                                    )
-                                    .await
-                                    .unwrap_or_else(|e| agent::CommandOutput {
-                                        output: format!("(execution error: {e:#})"),
-                                        exit_code: None,
-                                        timed_out: false,
-                                    });
+                                    let output = if !allow_sudo && agent::looks_like_sudo(cmd) {
+                                        agent::CommandOutput {
+                                            output: "(blocked: sudo commands are disabled in FireCode settings)".to_owned(),
+                                            exit_code: None,
+                                            timed_out: false,
+                                        }
+                                    } else {
+                                        agent::execute_command(cmd, &workdir, shell, timeout)
+                                            .await
+                                            .unwrap_or_else(|e| agent::CommandOutput {
+                                                output: format!("(execution error: {e:#})"),
+                                                exit_code: None,
+                                                timed_out: false,
+                                            })
+                                    };
                                     send(
                                         &event_tx,
                                         ChatEvent::CommandFinished {
@@ -370,6 +376,11 @@ fn default_toggles(config: &config::Config) -> (bool, bool, bool) {
 struct FireCodeApp {
     config: config::Config,
     config_path: std::path::PathBuf,
+    settings: settings::Settings,
+    settings_draft: settings::Settings,
+    settings_open: bool,
+    settings_error: Option<String>,
+    resolved_profile: String,
     tokens: BTreeMap<String, TokenStatus>,
     default_token: Option<String>,
     sessions: Vec<deepseek::SessionInfo>,
@@ -599,9 +610,18 @@ impl FireCodeApp {
         if let Err(e) = agent::ensure_agents_md() {
             eprintln!("AGENTS.md: {e:#}");
         }
+        let settings = settings::load_or_create().unwrap_or_else(|e| {
+            eprintln!("settings: {e:#}");
+            settings::Settings::default()
+        });
         let mut app = Self {
             config,
             config_path,
+            settings_draft: settings.clone(),
+            settings,
+            settings_open: false,
+            settings_error: None,
+            resolved_profile: String::new(),
             tokens: BTreeMap::new(),
             default_token: None,
             sessions: Vec::new(),
@@ -634,6 +654,9 @@ impl FireCodeApp {
 
     fn reread_tokens(&mut self) {
         self.default_token = None;
+        let preset = self.settings.browser.preset;
+        let profile_dir = config::resolve_profile_dir(&self.config, preset);
+        self.resolved_profile = profile_dir.display().to_string();
         let ids: Vec<String> = self.config.sites.keys().cloned().collect();
         for id in ids {
             self.tokens.insert(id.clone(), TokenStatus::Pending);
@@ -649,7 +672,7 @@ impl FireCodeApp {
                     continue;
                 }
             };
-            match auth::read_token(std::path::Path::new(&self.config.profile.path), &site.token) {
+            match auth::read_token(&profile_dir, preset, &site.token) {
                 Ok(token) => {
                     if id == self.config.default_site {
                         self.default_token = Some(token.value.clone());
@@ -682,6 +705,33 @@ impl FireCodeApp {
     fn refresh_sessions(&mut self) {
         if let Some(cmd_tx) = self.cmd_tx.clone() {
             let _ = cmd_tx.send(WorkerCommand::RefreshSessions);
+        }
+    }
+
+    fn save_settings(&mut self) {
+        match settings::save(&self.settings_draft) {
+            Ok(()) => {
+                self.settings = self.settings_draft.clone();
+                self.settings_error = None;
+                self.reread_tokens();
+            }
+            Err(e) => {
+                self.settings_error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    fn reset_settings(&mut self) {
+        match settings::load_or_create() {
+            Ok(saved) => {
+                self.settings = saved.clone();
+                self.settings_draft = saved;
+                self.settings_error = None;
+                self.reread_tokens();
+            }
+            Err(e) => {
+                self.settings_error = Some(format!("{e:#}"));
+            }
         }
     }
 
@@ -799,6 +849,7 @@ impl FireCodeApp {
                 search_enabled: self.active.search,
             },
             agent: self.active.code,
+            allow_sudo: self.settings.agent.allow_sudo,
         });
     }
 
@@ -1004,13 +1055,13 @@ impl eframe::App for FireCodeApp {
                         .id_salt("auth_panel")
                         .show(ui, |ui| {
                             ui.monospace(self.config_path.display().to_string());
-                            if self.config.profile.path.is_empty() {
+                            if self.resolved_profile.is_empty() {
                                 ui.colored_label(
                                     egui::Color32::YELLOW,
-                                    "Firefox profile: not detected",
+                                    "profile: not detected",
                                 );
                             } else {
-                                ui.label(format!("profile: {}", self.config.profile.path));
+                                ui.label(format!("profile: {}", self.resolved_profile));
                             }
                             for (id, status) in &self.tokens {
                                 match status {
@@ -1052,6 +1103,19 @@ impl eframe::App for FireCodeApp {
                         }
                     });
                     ui.separator();
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 22.0],
+                                egui::Button::new("⚙ Settings"),
+                            )
+                            .clicked()
+                        {
+                            self.settings_draft = self.settings.clone();
+                            self.settings_error = None;
+                            self.settings_open = true;
+                        }
+                    });
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let active_id = self.active.id.clone();
                         let mut open_request: Option<(String, String)> = None;
@@ -1119,6 +1183,60 @@ impl eframe::App for FireCodeApp {
                     );
                 }
             });
+
+            if self.settings_open {
+                let mut open = self.settings_open;
+                egui::Window::new("Settings")
+                    .open(&mut open)
+                    .resizable(false)
+                    .show(&ctx, |ui| {
+                        ui.strong("Agent");
+                        ui.checkbox(
+                            &mut self.settings_draft.agent.allow_sudo,
+                            "Allow sudo commands",
+                        );
+                        ui.weak("When off, sudo commands are blocked and the agent is told so in feedback.");
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.strong("Browser (token source)");
+                        let selected = self.settings_draft.browser.preset;
+                        egui::ComboBox::from_id_salt("browser_preset_combo")
+                            .selected_text(selected.display_name())
+                            .show_ui(ui, |ui| {
+                                for preset in settings::BrowserPreset::all() {
+                                    ui.selectable_value(
+                                        &mut self.settings_draft.browser.preset,
+                                        preset,
+                                        preset.display_name(),
+                                    );
+                                }
+                            });
+                        let resolved = config::resolve_profile_dir(
+                            &self.config,
+                            self.settings_draft.browser.preset,
+                        );
+                        ui.monospace(resolved.display().to_string());
+                        if self.settings_draft.browser.preset != settings::BrowserPreset::Firefox {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "Chrome/Yandex profiles keep tokens in LevelDB storage - reading is not implemented yet.",
+                            );
+                        }
+                        if let Some(error) = &self.settings_error {
+                            ui.colored_label(egui::Color32::RED, error);
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                self.save_settings();
+                            }
+                            if ui.button("Reset").clicked() {
+                                self.reset_settings();
+                            }
+                        });
+                    });
+                self.settings_open = open;
+            }
 
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.horizontal(|ui| {

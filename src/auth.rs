@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::Connection;
 
 use crate::config::{TOKEN_KIND_COOKIE, TOKEN_KIND_LOCAL_STORAGE, TokenSourceConfig};
+use crate::settings::BrowserPreset;
 
 pub const MASKED_PREFIX: usize = 8;
 pub const MASKED_SUFFIX: usize = 4;
@@ -56,9 +57,19 @@ pub fn mask(value: &str) -> String {
     format!("{head}\u{2026}{tail} ({} chars)", chars.len())
 }
 
-pub fn read_token(profile_dir: &Path, source: &TokenSourceConfig) -> Result<Token> {
+pub fn read_token(
+    profile_dir: &Path,
+    preset: BrowserPreset,
+    source: &TokenSourceConfig,
+) -> Result<Token> {
     match source.kind.as_str() {
         TOKEN_KIND_LOCAL_STORAGE => {
+            if preset != BrowserPreset::Firefox {
+                bail!(
+                    "{} profiles keep tokens in LevelDB storage - reading is not implemented yet",
+                    preset.display_name()
+                );
+            }
             let keys = source
                 .keys
                 .first()
@@ -217,9 +228,10 @@ mod tests {
     fn real_profile_token_is_readable() {
         let (config, path) = crate::config::load_or_create().expect("config load failed");
         println!("config: {}", path.display());
-        let profile = config.profile.path.clone();
+        let preset = crate::settings::BrowserPreset::Firefox;
+        let profile = crate::config::resolve_profile_dir(&config, preset);
         let site = config.site(&config.default_site).expect("default site");
-        let token = read_token(Path::new(&profile), &site.token).expect("token read failed");
+        let token = read_token(&profile, preset, &site.token).expect("token read failed");
         println!("site '{}', key '{}': {}", config.default_site, token.key, token.masked());
         assert!(token.value.len() > 20);
         assert!(

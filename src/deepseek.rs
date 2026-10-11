@@ -634,12 +634,11 @@ mod tests {
     fn real_client() -> (DeepSeekClient, config::Config) {
         let (config, _) = crate::config::load_or_create().expect("config");
         let site = config.site(&config.default_site).expect("site");
-        let token = crate::auth::read_token(
-            std::path::Path::new(&config.profile.path),
-            &site.token,
-        )
-        .expect("token")
-        .value;
+        let preset = crate::settings::BrowserPreset::Firefox;
+        let profile = crate::config::resolve_profile_dir(&config, preset);
+        let token = crate::auth::read_token(&profile, preset, &site.token)
+            .expect("token")
+            .value;
         let client = DeepSeekClient::new(&site.api_base, &token).expect("client");
         (client, config)
     }

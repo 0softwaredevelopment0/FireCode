@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+use crate::settings::BrowserPreset;
+
 pub const TOKEN_KIND_LOCAL_STORAGE: &str = "localStorage";
 pub const TOKEN_KIND_COOKIE: &str = "cookie";
 
@@ -203,6 +205,20 @@ pub fn detect_default_profile() -> Option<PathBuf> {
         .filter(|p| p.exists())?;
 
     parse_profiles_ini(&ini)
+}
+
+/// Resolves the profile directory: an explicit `profile.path` in the config
+/// wins, otherwise the selected browser preset supplies its default.
+pub fn resolve_profile_dir(config: &Config, preset: BrowserPreset) -> PathBuf {
+    if !config.profile.path.trim().is_empty() {
+        return PathBuf::from(config.profile.path.trim());
+    }
+    match preset {
+        BrowserPreset::Firefox => detect_default_profile().unwrap_or_default(),
+        BrowserPreset::Chrome | BrowserPreset::Yandex => {
+            preset.default_profile_dir().unwrap_or_default()
+        }
+    }
 }
 
 fn dirs_home() -> Option<PathBuf> {

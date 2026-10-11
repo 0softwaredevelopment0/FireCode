@@ -78,6 +78,11 @@ pub enum Shell {
     Cmd,
 }
 
+/// True when the command asks for elevation via sudo.
+pub fn looks_like_sudo(cmd: &str) -> bool {
+    cmd.split_whitespace().next() == Some("sudo")
+}
+
 impl Shell {
     pub fn parse(s: &str) -> Shell {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -333,6 +338,15 @@ mod tests {
         let feedback = build_feedback(&results);
         assert!(feedback.contains("Command \"echo\":\n(no output)"));
         assert!(feedback.contains("Command \"slow\":\n(no output)\n(did not exit)\n(timed out)"));
+    }
+
+    #[test]
+    fn sudo_detection() {
+        assert!(looks_like_sudo("sudo apt update"));
+        assert!(looks_like_sudo("  sudo rm -rf /"));
+        assert!(!looks_like_sudo("echo sudo"));
+        assert!(!looks_like_sudo("sudoers"));
+        assert!(!looks_like_sudo(""));
     }
 
     /// Runs a real shell on this machine.
