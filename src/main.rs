@@ -588,13 +588,32 @@ fn markdown_blocks_ui(
     }
 }
 
-/// Command execution output: ONE window - a single dark frame containing
-/// the clickable header row (triangle + command, dark fill, lighter on
-/// hover) and the body below it. Collapsed by default to a scrollable
-/// preview (mouse wheel or scrollbar); clicking the header row toggles the
-/// full output. An empty body renders the header row only.
+/// Command execution output: ONE window sized to its content - it
+/// stretches right only as far as the widest text line (capped by the
+/// chat width, where long lines wrap) instead of the full chat width.
+/// A single dark frame containing the clickable header row (triangle +
+/// command, lighter on hover) and the body below. Collapsed by default
+/// to a fixed ~10-real-line scrollable preview (mouse wheel or
+/// scrollbar); clicking the header row toggles the full output. An empty
+/// body renders the header row only.
 fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) {
     let expanded = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(id, false));
+
+    let mono_size = egui::TextStyle::Monospace.resolve(ui.style()).size;
+    let measure = |text: String| -> egui::Vec2 {
+        ui.fonts_mut(|fonts| {
+            fonts
+                .layout_job(egui::text::LayoutJob::simple(
+                    text,
+                    egui::FontId::monospace(mono_size),
+                    egui::Color32::WHITE,
+                    f32::INFINITY,
+                ))
+                .size()
+        })
+    };
+    let row_h = measure("Ag".to_owned()).y;
+    let char_w = measure("0".to_owned()).x;
 
     // multiline feedback headers (multiline commands span lines inside
     // `Command "...":`) must not leak into the single-line header row -
@@ -609,18 +628,16 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
         }
     };
 
-    let mono_size = egui::TextStyle::Monospace.resolve(ui.style()).size;
-    let row_h = ui.fonts_mut(|fonts| {
-        fonts
-            .layout_job(egui::text::LayoutJob::simple(
-                "Ag".to_owned(),
-                egui::FontId::monospace(mono_size),
-                egui::Color32::WHITE,
-                f32::INFINITY,
-            ))
-            .size()
-            .y
-    });
+    // window width = widest of the header and body text (monospace
+    // char-count estimate) plus frame paddings, capped by the chat width
+    let body_w = body
+        .lines()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0) as f32
+        * char_w;
+    let header_w = measure(format!("▸ {header_line}")).x;
+    let content_w = (body_w.max(header_w) + 18.0).min(ui.available_width());
 
     egui::Frame::default()
         .fill(egui::Color32::from_rgb(30, 30, 34))
@@ -628,7 +645,7 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
         .corner_radius(6)
         .inner_margin(egui::Margin::same(0))
         .show(ui, |ui| {
-            ui.allocate_space(egui::vec2(ui.available_width(), 0.0));
+            ui.set_max_width(content_w);
 
             // header row: click target + background fill, text as a real
             // widget (painter text is what caused the frozen-copy artifact)
@@ -639,7 +656,7 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
                 .y
                 .max(row_h * 1.4);
             let (rect, response) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), header_h),
+                egui::vec2(content_w, header_h),
                 egui::Sense::click(),
             );
             if response.clicked() {
@@ -672,20 +689,24 @@ fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) 
             );
 
             if !body.is_empty() {
-                ui.separator();
+                // thin divider under the header, content width only
+                let (sep_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(content_w, 1.0), egui::Sense::hover());
+                ui.painter().line_segment(
+                    [sep_rect.left_top(), sep_rect.right_top()],
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 76)),
+                );
                 egui::Frame::default()
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         if expanded {
                             ui.monospace(body);
                         } else {
-                            // fixed ~10-real-line preview at full width:
-                            // allocate_ui pins the viewport height (short
-                            // output is padded, long output scrolls) and
-                            // the scrollbar hugs the window's right edge
+                            // fixed ~10-real-line preview; the scrollbar
+                            // hugs this window's right edge
                             let preview_h = row_h * 20.0;
                             ui.allocate_ui(
-                                egui::vec2(ui.available_width(), preview_h),
+                                egui::vec2((content_w - 16.0).max(0.0), preview_h),
                                 |ui| {
                                     egui::ScrollArea::vertical()
                                         .id_salt(id.with("scroll"))
