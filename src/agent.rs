@@ -141,6 +141,14 @@ pub async fn execute_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        // a console child of a GUI app gets a visible window by default;
+        // no flag inside the command text can prevent that, only the spawner
+        // can - so every agent command runs fully headless.
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
 
     let child = command
         .spawn()
@@ -227,6 +235,9 @@ Rules:
   persist between commands. Chain it inside one command if needed.
 - Commands must be non-interactive: never ask for input, use flags like
   `-y` / `--yes`. Prefer PowerShell syntax (`;` instead of `&&`).
+- Every command runs fully headless: no terminal window ever opens, you only
+  receive captured text output. Never try to open windows, GUI apps, or
+  anything interactive - there is no screen to show them on.
 - After all commands finish you receive their results as a feedback message:
   `Command "cmd":` followed by the captured output (long output is
   truncated). That feedback triggers you again automatically, so you do NOT
