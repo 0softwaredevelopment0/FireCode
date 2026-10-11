@@ -583,6 +583,60 @@ fn markdown_blocks_ui(
     }
 }
 
+/// Command execution output: full-width window, 10 text rows tall with
+/// its own scrollbar, expandable to the full output via the chevron.
+/// Keeps long outputs from flooding the chat.
+fn command_output_ui(ui: &mut egui::Ui, message_text: &str) {
+    let mut lines = message_text.lines();
+    let cmd_line = lines.next().unwrap_or("$").to_owned();
+    let output: String = lines.collect::<Vec<_>>().join("\n");
+
+    let state_id = egui::Id::new(("cmdexpand", cmd_line.clone()));
+    let expanded = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(state_id, false));
+
+    ui.horizontal(|ui| {
+        ui.monospace(cmd_line.clone());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let label = if expanded { "▲ less" } else { "▼ more" };
+            if ui.small_button(label).clicked() {
+                ui.memory_mut(|mem| {
+                    let flag = mem.data.get_temp_mut_or(state_id, false);
+                    *flag = !*flag;
+                });
+            }
+        });
+    });
+    let mono_size = egui::TextStyle::Monospace.resolve(ui.style()).size;
+    let row_h = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_job(egui::text::LayoutJob::simple(
+                "Ag".to_owned(),
+                egui::FontId::monospace(mono_size),
+                egui::Color32::WHITE,
+                f32::INFINITY,
+            ))
+            .size()
+            .y
+    });
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(30, 30, 34))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 76)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            let area = egui::ScrollArea::vertical().id_salt(("cmdscroll", cmd_line));
+            let area = if expanded {
+                area
+            } else {
+                area.max_height(row_h * 10.0)
+            };
+            area.show(ui, |ui| {
+                ui.monospace(output);
+            });
+        });
+    ui.add_space(2.0);
+}
+
 fn code_block_ui(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -1431,15 +1485,7 @@ impl eframe::App for FireCodeApp {
                                     );
                                 }
                                 "command" => {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.strong("⚙");
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&message.text).monospace(),
-                                            )
-                                            .wrap_mode(egui::TextWrapMode::Extend),
-                                        );
-                                    });
+                                    command_output_ui(ui, &message.text);
                                 }
                                 "feedback" => {
                                     ui.strong("⚙ Feedback:");
