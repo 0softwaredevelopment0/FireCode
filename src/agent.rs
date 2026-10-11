@@ -14,10 +14,38 @@ pub struct ParsedResponse {
     pub continue_next: bool,
 }
 
+/// Unescapes a double-quoted command string: `\"` → `"`, `\\` → `\`,
+/// `\n` → newline, `\t` → tab, `\r` → carriage return. Unknown escapes and
+/// a trailing lone backslash stay literal.
+fn unescape_command_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// Extracts single-line `<command:"...">` commands, multiline
-/// `<command-header>` / `<string:"...">` / `<command-footer>` blocks and a
-/// trailing `<continue>` marker from a response. Anything else stays in
-/// `text`. A multiline block runs as one command (lines joined with `\n`).
+/// `<command-header>` / `<string:"...">` (or `<string:'...'>`) /
+/// `<command-footer>` blocks and a trailing `<continue>` marker from a
+/// response. Anything else stays in `text`. A multiline block runs as one
+/// command (lines joined with `\n`).
 pub fn parse_response(raw: &str) -> ParsedResponse {
     let mut text = String::new();
     let mut commands = Vec::new();
@@ -38,16 +66,11 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
         if multi.is_some() {
             if trimmed == "<command-footer>" {
                 flush_multi(&mut multi, &mut commands);
-            } else if let Some(cmd) = trimmed
-                .strip_prefix("<string:\"")
-                .and_then(|rest| rest.strip_suffix("\">"))
-            {
-                if !cmd.trim().is_empty() {
-                    multi
-                        .as_mut()
-                        .expect("multiline block open")
-                        .push(cmd.trim().to_owned());
-                }
+            } else if let Some(cmd) = extract_string_line(trimmed) {
+                multi
+                    .as_mut()
+                    .expect("multiline block open")
+                    .push(cmd);
             }
             continue;
         }
@@ -58,10 +81,10 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
         if let Some(cmd) = trimmed
             .strip_prefix("<command:\"")
             .and_then(|rest| rest.strip_suffix("\">"))
+            .map(|inner| unescape_command_string(inner.trim()))
+            .filter(|cmd| !cmd.is_empty())
         {
-            if !cmd.trim().is_empty() {
-                commands.push(cmd.trim().to_owned());
-            }
+            commands.push(cmd);
             continue;
         }
         if trimmed == "<continue>" {
@@ -79,6 +102,26 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
         commands,
         continue_next,
     }
+}
+
+/// Extracts one `<string:...>` line: the double-quoted form unescapes,
+/// the single-quoted form is raw (free `"` embedding). Empty lines yield None.
+fn extract_string_line(trimmed: &str) -> Option<String> {
+    if let Some(inner) = trimmed
+        .strip_prefix("<string:\"")
+        .and_then(|rest| rest.strip_suffix("\">"))
+    {
+        let cmd = unescape_command_string(inner.trim());
+        return if cmd.is_empty() { None } else { Some(cmd) };
+    }
+    if let Some(inner) = trimmed
+        .strip_prefix("<string:'")
+        .and_then(|rest| rest.strip_suffix("'>"))
+    {
+        let cmd = inner.trim().to_owned();
+        return if cmd.is_empty() { None } else { Some(cmd) };
+    }
+    None
 }
 
 /// Builds the feedback message sent back to the chat after command
@@ -294,6 +337,18 @@ Every line inside must use the `<string:"...">` syntax:
 The lines run together as one multiline command, top to bottom. The same
 rules as single-line commands apply (fresh shell, non-interactive, headless).
 
+### Quoting inside `<string:"...">` (and `<command:"...">`)
+
+Backslash starts an escape sequence: `\"` → `"`, `\\` → `\`, `\n` →
+newline, `\t` → tab, `\r` → carriage return. Unknown escapes stay literal.
+Double every backslash in Windows paths (`C:\\notes`), or use the
+single-quoted form below.
+
+For quote-heavy content use the single-quoted form - no processing inside,
+`"` embeds freely:
+
+<string:'Write-Host "hi"'>
+
 ## Tool 2: continue
 
 Every user request is just an information output task, and one response may
@@ -324,12 +379,24 @@ pub fn ensure_prompt_md() -> Result<PathBuf> {
     // if the user has not added them (their own edits are kept as-is).
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    if !raw.contains("<command-header>") {
-        let mut updated = raw;
+    let mut updated = raw;
+    let mut changed = false;
+    if !updated.contains("<command-header>") {
         if !updated.ends_with('\n') {
             updated.push('\n');
         }
         updated.push_str(&multiline_tool_section());
+        changed = true;
+    }
+    // quoting docs arrived one version later than the block syntax itself
+    if !updated.contains("Quoting inside") {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&quoting_docs_section());
+        changed = true;
+    }
+    if changed {
         std::fs::write(&path, updated)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
@@ -351,6 +418,22 @@ Every line inside must use the `<string:"...">` syntax:
 
 The lines run together as one multiline command, top to bottom. The same
 rules as single-line commands apply (fresh shell, non-interactive, headless).
+"#
+}
+
+fn quoting_docs_section() -> &'static str {
+    r#"
+### Quoting inside `<string:"...">` (and `<command:"...">`)
+
+Backslash starts an escape sequence: `\"` → `"`, `\\` → `\`, `\n` →
+newline, `\t` → tab, `\r` → carriage return. Unknown escapes stay literal.
+Double every backslash in Windows paths (`C:\\notes`), or use the
+single-quoted form below.
+
+For quote-heavy content use the single-quoted form - no processing inside,
+`"` embeds freely:
+
+<string:'Write-Host "hi"'>
 "#
 }
 
@@ -448,6 +531,38 @@ mod tests {
         let feedback = build_feedback(&results);
         assert!(feedback.contains("Command \"echo\":\n(no output)"));
         assert!(feedback.contains("Command \"slow\":\n(no output)\n(did not exit)\n(timed out)"));
+    }
+
+    #[test]
+    fn parse_string_escapes() {
+        let raw = "<command-header>\n<string:\"Write-Host \\\"hi\\\", path C:\\\\notes\">\n<string:\"line1\\nline2\\ttab\\rend\">\n<command-footer>";
+        let parsed = parse_response(raw);
+        assert_eq!(
+            parsed.commands,
+            vec!["Write-Host \"hi\", path C:\\notes\nline1\nline2\ttab\rend".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parse_single_quoted_string_is_raw() {
+        let raw = "<command-header>\n<string:'Write-Host \"hi\" and C:\\notes\\n'>\n<command-footer>";
+        let parsed = parse_response(raw);
+        assert_eq!(
+            parsed.commands,
+            vec!["Write-Host \"hi\" and C:\\notes\\n".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parse_unknown_escapes_stay_literal() {
+        let parsed = parse_response("<command:\"echo a\\xb\\\">");
+        assert_eq!(parsed.commands, vec!["echo a\\xb\\".to_owned()]);
+    }
+
+    #[test]
+    fn parse_escaped_single_line_command() {
+        let parsed = parse_response("<command:\"echo \\\"hi\\\"\">");
+        assert_eq!(parsed.commands, vec!["echo \"hi\"".to_owned()]);
     }
 
     #[test]
