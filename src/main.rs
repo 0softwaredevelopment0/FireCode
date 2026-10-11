@@ -9,7 +9,7 @@ mod pow;
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, Sender};
 
-use markdown::Segment;
+use markdown::{Block, InlineSpan};
 
 #[derive(Debug, Clone)]
 enum TokenStatus {
@@ -221,6 +221,110 @@ struct ActiveSession {
     last_message_id: Option<i64>,
     deepthink: bool,
     search: bool,
+}
+
+fn spans_to_job(
+    ui: &mut egui::Ui,
+    spans: &[InlineSpan],
+    size: f32,
+    bright: bool,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let text_color = ui.visuals().text_color();
+    let strong = ui.visuals().strong_text_color();
+    let weak = ui.visuals().weak_text_color();
+    for span in spans {
+        let (text, font_id, color, bg) = match span {
+            InlineSpan::Plain(t) => (
+                t,
+                egui::FontId::proportional(size),
+                if bright {
+                    text_color
+                } else {
+                    text_color.gamma_multiply(0.92)
+                },
+                egui::Color32::TRANSPARENT,
+            ),
+            InlineSpan::Bold(t) => (
+                t,
+                egui::FontId::proportional(size * 1.08),
+                strong,
+                egui::Color32::TRANSPARENT,
+            ),
+            InlineSpan::Italic(t) => (
+                t,
+                egui::FontId::proportional(size),
+                weak,
+                egui::Color32::TRANSPARENT,
+            ),
+            InlineSpan::Code(t) => (
+                t,
+                egui::FontId::monospace(size * 0.92),
+                egui::Color32::from_rgb(225, 225, 230),
+                egui::Color32::from_rgb(45, 45, 50),
+            ),
+        };
+        let mut format = egui::TextFormat::simple(font_id, color);
+        format.background = bg;
+        job.append(text, 0.0, format);
+    }
+    job
+}
+
+fn markdown_blocks_ui(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    text: &str,
+    id_salt: &str,
+    copied: &mut Option<(egui::Id, std::time::Instant)>,
+) {
+    let body = egui::TextStyle::Body.resolve(ui.style()).size;
+    for (bi, block) in markdown::parse_blocks(text).iter().enumerate() {
+        match block {
+            Block::Paragraph(p) => {
+                let job = spans_to_job(ui, &markdown::parse_inline(p), body, false);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(job);
+                });
+            }
+            Block::Heading { level, text: h } => {
+                let size = body * match level {
+                    1 => 1.5,
+                    2 => 1.3,
+                    3 => 1.15,
+                    _ => 1.05,
+                };
+                let job = spans_to_job(ui, &markdown::parse_inline(h), size, true);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(job);
+                });
+                ui.add_space(2.0);
+            }
+            Block::BulletItem(t) => {
+                let job = spans_to_job(ui, &markdown::parse_inline(t), body, false);
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("  •  ");
+                    ui.label(job);
+                });
+            }
+            Block::OrderedItem { num, text: t } => {
+                let job = spans_to_job(ui, &markdown::parse_inline(t), body, false);
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(format!("  {num}. "));
+                    ui.label(job);
+                });
+            }
+            Block::Code { lang, code, closed } => code_block_ui(
+                ui,
+                ctx,
+                lang,
+                code,
+                *closed,
+                egui::Id::new((id_salt, bi)),
+                copied,
+            ),
+        }
+    }
 }
 
 fn code_block_ui(
@@ -797,26 +901,13 @@ impl eframe::App for FireCodeApp {
                                                 });
                                             });
                                     }
-                                    for (si, segment) in
-                                        markdown::split_fenced(&message.text).iter().enumerate()
-                                    {
-                                        match segment {
-                                            Segment::Text(t) => {
-                                                ui.horizontal_wrapped(|ui| {
-                                                    ui.label(t.trim_end_matches('\n'));
-                                                });
-                                            }
-                                            Segment::Code { lang, code, closed } => code_block_ui(
-                                                ui,
-                                                &ctx2,
-                                                lang,
-                                                code,
-                                                *closed,
-                                                egui::Id::new(("codeblock", mi, si)),
-                                                &mut self.copied_code,
-                                            ),
-                                        }
-                                    }
+                                    markdown_blocks_ui(
+                                        ui,
+                                        &ctx2,
+                                        &message.text,
+                                        format!("blocks{mi}").as_str(),
+                                        &mut self.copied_code,
+                                    );
                                 }
                                 _ => {
                                     ui.colored_label(
@@ -834,26 +925,13 @@ impl eframe::App for FireCodeApp {
                                     ui.weak(format!("🧠 {thinking}\u{258c}"));
                                 });
                             }
-                            for (si, segment) in
-                                markdown::split_fenced(&streaming.text).iter().enumerate()
-                            {
-                                match segment {
-                                    Segment::Text(t) => {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(t.trim_end_matches('\n'));
-                                        });
-                                    }
-                                    Segment::Code { lang, code, closed } => code_block_ui(
-                                        ui,
-                                        &ctx2,
-                                        lang,
-                                        code,
-                                        *closed,
-                                        egui::Id::new(("streamcode", si)),
-                                        &mut self.copied_code,
-                                    ),
-                                }
-                            }
+                            markdown_blocks_ui(
+                                ui,
+                                &ctx2,
+                                &streaming.text,
+                                "streamblocks",
+                                &mut self.copied_code,
+                            );
                             if streaming.text.is_empty() && streaming.thinking.is_none() {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spinner();
