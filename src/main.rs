@@ -584,22 +584,12 @@ fn markdown_blocks_ui(
 }
 
 /// Command execution output: full-width window (always stretched to the
-/// right edge, adaptive on resize) showing the whole output with no inner
-/// scrolling. The chevron collapses it to 10 rows for giant outputs.
-fn command_output_ui(ui: &mut egui::Ui, header: &str, body: &str) {
-    let state_id = egui::Id::new(("cmdexpand", header));
-    let collapsed = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(state_id, false));
+/// right edge, adaptive on resize) with a clickable header row. Collapsed
+/// by default to a 10-row scrollable preview (mouse wheel or scrollbar);
+/// clicking the header toggles the full output.
+fn command_output_ui(ui: &mut egui::Ui, id: egui::Id, header: &str, body: &str) {
+    let expanded = ui.memory_mut(|mem| *mem.data.get_temp_mut_or(id, false));
 
-    ui.horizontal_wrapped(|ui| {
-        let label = if collapsed { "▼ more" } else { "▲ less" };
-        if ui.small_button(label).clicked() {
-            ui.memory_mut(|mem| {
-                let flag = mem.data.get_temp_mut_or(state_id, false);
-                *flag = !*flag;
-            });
-        }
-        ui.monospace(header);
-    });
     let mono_size = egui::TextStyle::Monospace.resolve(ui.style()).size;
     let row_h = ui.fonts_mut(|fonts| {
         fonts
@@ -612,6 +602,45 @@ fn command_output_ui(ui: &mut egui::Ui, header: &str, body: &str) {
             .size()
             .y
     });
+
+    // full-width clickable header row: triangle + command text
+    let header_h = ui
+        .style()
+        .spacing
+        .interact_size
+        .y
+        .max(row_h * 1.3);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), header_h),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        ui.memory_mut(|mem| {
+            let flag = mem.data.get_temp_mut_or(id, false);
+            *flag = !*flag;
+        });
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect_filled(
+        rect,
+        4,
+        if response.hovered() {
+            egui::Color32::from_rgb(48, 48, 55)
+        } else {
+            egui::Color32::from_rgb(38, 38, 44)
+        },
+    );
+    let tri = if expanded { "▾" } else { "▸" };
+    ui.painter().text(
+        rect.left_center() + egui::vec2(6.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        format!("{tri} {header}"),
+        egui::FontId::monospace(mono_size),
+        egui::Color32::from_rgb(225, 225, 230),
+    );
+
     egui::Frame::default()
         .fill(egui::Color32::from_rgb(30, 30, 34))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 76)))
@@ -619,15 +648,15 @@ fn command_output_ui(ui: &mut egui::Ui, header: &str, body: &str) {
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.allocate_space(egui::vec2(ui.available_width(), 0.0));
-            if collapsed {
+            if expanded {
+                ui.monospace(body);
+            } else {
                 egui::ScrollArea::vertical()
-                    .id_salt(("cmdscroll", header))
+                    .id_salt(id.with("scroll"))
                     .max_height(row_h * 10.0)
                     .show(ui, |ui| {
                         ui.monospace(body);
                     });
-            } else {
-                ui.monospace(body);
             }
         });
     ui.add_space(2.0);
@@ -1485,7 +1514,12 @@ impl eframe::App for FireCodeApp {
                                     let header = lines.next().unwrap_or("$");
                                     let body: String =
                                         lines.collect::<Vec<_>>().join("\n");
-                                    command_output_ui(ui, header, &body);
+                                    command_output_ui(
+                                        ui,
+                                        egui::Id::new(("cmdblock", mi)),
+                                        header,
+                                        &body,
+                                    );
                                 }
                                 "feedback" => {
                                     ui.strong("⚙ Feedback:");
@@ -1500,8 +1534,15 @@ impl eframe::App for FireCodeApp {
                                             &mut self.copied_code,
                                         );
                                     } else {
-                                        for (header, body) in &blocks {
-                                            command_output_ui(ui, header, body);
+                                        for (bi, (header, body)) in
+                                            blocks.iter().enumerate()
+                                        {
+                                            command_output_ui(
+                                                ui,
+                                                egui::Id::new(("fblock", mi, bi)),
+                                                header,
+                                                body,
+                                            );
                                         }
                                     }
                                 }
