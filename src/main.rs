@@ -3,12 +3,14 @@
 mod auth;
 mod config;
 mod deepseek;
+mod fonts;
 mod markdown;
 mod pow;
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, Sender};
 
+use egui::FontFamily;
 use markdown::{Block, InlineSpan};
 
 #[derive(Debug, Clone)]
@@ -228,16 +230,25 @@ fn spans_to_job(
     spans: &[InlineSpan],
     size: f32,
     bright: bool,
+    force_bold_family: bool,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let text_color = ui.visuals().text_color();
     let strong = ui.visuals().strong_text_color();
     let weak = ui.visuals().weak_text_color();
+    let plain_family = FontFamily::Proportional;
+    let bold_family = FontFamily::Name("bold".into());
+    let italic_family = FontFamily::Name("italic".into());
+    let plain_font = if force_bold_family {
+        bold_family.clone()
+    } else {
+        plain_family.clone()
+    };
     for span in spans {
         let (text, font_id, color, bg) = match span {
             InlineSpan::Plain(t) => (
                 t,
-                egui::FontId::proportional(size),
+                egui::FontId::new(size, plain_font.clone()),
                 if bright {
                     text_color
                 } else {
@@ -247,13 +258,13 @@ fn spans_to_job(
             ),
             InlineSpan::Bold(t) => (
                 t,
-                egui::FontId::proportional(size * 1.08),
+                egui::FontId::new(size, bold_family.clone()),
                 strong,
                 egui::Color32::TRANSPARENT,
             ),
             InlineSpan::Italic(t) => (
                 t,
-                egui::FontId::proportional(size),
+                egui::FontId::new(size, italic_family.clone()),
                 weak,
                 egui::Color32::TRANSPARENT,
             ),
@@ -270,7 +281,6 @@ fn spans_to_job(
     }
     job
 }
-
 fn markdown_blocks_ui(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -282,7 +292,7 @@ fn markdown_blocks_ui(
     for (bi, block) in markdown::parse_blocks(text).iter().enumerate() {
         match block {
             Block::Paragraph(p) => {
-                let job = spans_to_job(ui, &markdown::parse_inline(p), body, false);
+                let job = spans_to_job(ui, &markdown::parse_inline(p), body, false, false);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(job);
                 });
@@ -294,21 +304,21 @@ fn markdown_blocks_ui(
                     3 => 1.15,
                     _ => 1.05,
                 };
-                let job = spans_to_job(ui, &markdown::parse_inline(h), size, true);
+                let job = spans_to_job(ui, &markdown::parse_inline(h), size, true, true);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(job);
                 });
                 ui.add_space(2.0);
             }
             Block::BulletItem(t) => {
-                let job = spans_to_job(ui, &markdown::parse_inline(t), body, false);
+                let job = spans_to_job(ui, &markdown::parse_inline(t), body, false, false);
                 ui.horizontal_wrapped(|ui| {
                     ui.weak("  •  ");
                     ui.label(job);
                 });
             }
             Block::OrderedItem { num, text: t } => {
-                let job = spans_to_job(ui, &markdown::parse_inline(t), body, false);
+                let job = spans_to_job(ui, &markdown::parse_inline(t), body, false, false);
                 ui.horizontal_wrapped(|ui| {
                     ui.weak(format!("  {num}. "));
                     ui.label(job);
@@ -959,6 +969,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "FireCode",
         options,
-        Box::new(|_cc| Ok(Box::new(FireCodeApp::new(config, config_path)))),
+        Box::new(|cc| {
+            fonts::install(&cc.egui_ctx);
+            Ok(Box::new(FireCodeApp::new(config, config_path)))
+        }),
     )
 }
