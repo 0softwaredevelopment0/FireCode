@@ -20,6 +20,45 @@ pub struct Config {
     pub presets: BTreeMap<String, PresetConfig>,
     #[serde(default = "default_preset_id")]
     pub default_preset: String,
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+/// Coding-agent loop settings. `working_dir` empty = the exe directory
+/// (the app is portable, AGENTS.md lives next to it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    #[serde(default = "default_agent_shell")]
+    pub shell: String,
+    #[serde(default)]
+    pub working_dir: String,
+    #[serde(default = "default_agent_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_agent_max_steps")]
+    pub max_steps: u32,
+}
+
+fn default_agent_shell() -> String {
+    "powershell".to_owned()
+}
+
+fn default_agent_timeout() -> u64 {
+    300
+}
+
+fn default_agent_max_steps() -> u32 {
+    25
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            shell: default_agent_shell(),
+            working_dir: String::new(),
+            timeout_secs: default_agent_timeout(),
+            max_steps: default_agent_max_steps(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +145,7 @@ impl Config {
             sites,
             presets: default_presets(),
             default_preset: default_preset_id(),
+            agent: AgentConfig::default(),
         }
     }
 

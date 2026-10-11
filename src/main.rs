@@ -1,5 +1,6 @@
 ﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod auth;
 mod config;
 mod deepseek;
@@ -26,6 +27,7 @@ enum WorkerCommand {
         parent_message_id: Option<i64>,
         text: String,
         options: deepseek::CompletionOptions,
+        agent: bool,
     },
     LoadHistory {
         session_id: String,
@@ -47,7 +49,14 @@ struct StreamingAnswer {
 }
 
 enum ChatEvent {
+    StreamStart,
     Delta(StreamingAnswer),
+    ResponseDone {
+        result: Result<(), String>,
+        last_message_id: Option<i64>,
+        /// In agent mode: message text with command/continue lines removed.
+        visible_text: Option<String>,
+    },
     Finished {
         result: Result<(), String>,
         last_message_id: Option<i64>,
@@ -62,9 +71,16 @@ enum ChatEvent {
     SessionsLoaded {
         result: Result<Vec<deepseek::SessionInfo>, String>,
     },
+    CommandStarted { cmd: String },
+    CommandFinished { cmd: String, output: agent::CommandOutput },
+    AgentMessage { role: &'static str, text: String },
 }
 
-fn spawn_worker(base_url: String, token: String) -> (Sender<WorkerCommand>, Receiver<ChatEvent>) {
+fn spawn_worker(
+    base_url: String,
+    token: String,
+    agent_config: config::AgentConfig,
+) -> (Sender<WorkerCommand>, Receiver<ChatEvent>) {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WorkerCommand>();
     let (event_tx, event_rx) = std::sync::mpsc::channel::<ChatEvent>();
 
@@ -90,6 +106,10 @@ fn spawn_worker(base_url: String, token: String) -> (Sender<WorkerCommand>, Rece
                     return;
                 }
             };
+            let shell = agent::Shell::parse(&agent_config.shell);
+            let workdir = agent::resolve_working_dir(&agent_config.working_dir);
+            let timeout = std::time::Duration::from_secs(agent_config.timeout_secs);
+            let max_steps = agent_config.max_steps;
 
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
@@ -98,48 +118,161 @@ fn spawn_worker(base_url: String, token: String) -> (Sender<WorkerCommand>, Rece
                         parent_message_id,
                         text,
                         options,
+                        agent,
                     } => {
-                        let sid = match session_id {
-                            Some(sid) => sid,
-                            None => match client.create_session().await {
-                                Ok(id) => {
-                                    let _ =
-                                        event_tx.send(ChatEvent::SessionCreated { id: id.clone() });
-                                    id
-                                }
-                                Err(e) => {
-                                    let _ = event_tx.send(ChatEvent::Finished {
-                                        result: Err(format!("create session: {e:#}")),
-                                        last_message_id: None,
-                                    });
-                                    continue;
-                                }
-                            },
+                        let mut session_id = session_id;
+                        let mut parent_message_id = parent_message_id;
+                        let mut next_text = text;
+
+                        // the agent loop: response -> commands -> feedback -> response
+                        let mut step = 0u32;
+                        let send = |event_tx: &Sender<ChatEvent>, event: ChatEvent| {
+                            let _ = event_tx.send(event);
                         };
-                        let result = try_prompt(
-                            &client,
-                            &sid,
-                            &text,
-                            parent_message_id,
-                            &options,
+                        loop {
+                            step += 1;
+                            if agent && step > max_steps {
+                                send(
+                                    &event_tx,
+                                    ChatEvent::AgentMessage {
+                                        role: "error",
+                                        text: format!(
+                                            "agent step limit reached ({max_steps}), stopping"
+                                        ),
+                                    },
+                                );
+                                break;
+                            }
+
+                            if session_id.is_none() {
+                                match client.create_session().await {
+                                    Ok(id) => {
+                                        send(&event_tx, ChatEvent::SessionCreated { id: id.clone() });
+                                        session_id = Some(id);
+                                    }
+                                    Err(e) => {
+                                        send(
+                                            &event_tx,
+                                            ChatEvent::Finished {
+                                                result: Err(format!("create session: {e:#}")),
+                                                last_message_id: None,
+                                            },
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            let sid = session_id.clone().expect("session checked above");
+
+                            send(&event_tx, ChatEvent::StreamStart);
+                            let result = try_prompt(
+                                &client,
+                                &sid,
+                                &next_text,
+                                parent_message_id,
+                                &options,
+                                &event_tx,
+                            )
+                            .await;
+                            let (full_text, last_id) = match result {
+                                Ok((text, id)) => (text, id),
+                                Err(e) => {
+                                    send(
+                                        &event_tx,
+                                        ChatEvent::ResponseDone {
+                                            result: Err(format!("{e:#}")),
+                                            last_message_id: None,
+                                            visible_text: None,
+                                        },
+                                    );
+                                    break;
+                                }
+                            };
+                            let parsed = if agent {
+                                Some(agent::parse_response(&full_text))
+                            } else {
+                                None
+                            };
+                            if let Some(id) = last_id {
+                                parent_message_id = Some(id);
+                            }
+                            send(
+                                &event_tx,
+                                ChatEvent::ResponseDone {
+                                    result: Ok(()),
+                                    last_message_id: last_id,
+                                    visible_text: parsed
+                                        .as_ref()
+                                        .map(|parsed| parsed.text.clone()),
+                                },
+                            );
+
+                            if !agent {
+                                break;
+                            }
+
+                            let parsed = parsed.expect("parsed in agent mode");
+                            if !parsed.commands.is_empty() {
+                                let mut results = Vec::new();
+                                for cmd in &parsed.commands {
+                                    send(&event_tx, ChatEvent::CommandStarted { cmd: cmd.clone() });
+                                    let output = agent::execute_command(
+                                        cmd,
+                                        &workdir,
+                                        shell,
+                                        timeout,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|e| agent::CommandOutput {
+                                        output: format!("(execution error: {e:#})"),
+                                        exit_code: None,
+                                        timed_out: false,
+                                    });
+                                    send(
+                                        &event_tx,
+                                        ChatEvent::CommandFinished {
+                                            cmd: cmd.clone(),
+                                            output: output.clone(),
+                                        },
+                                    );
+                                    results.push((cmd.clone(), output));
+                                }
+                                next_text = agent::build_feedback(&results);
+                                send(
+                                    &event_tx,
+                                    ChatEvent::AgentMessage {
+                                        role: "feedback",
+                                        text: next_text.clone(),
+                                    },
+                                );
+                                continue;
+                            }
+                            if parsed.continue_next {
+                                next_text = "Continue".to_owned();
+                                send(
+                                    &event_tx,
+                                    ChatEvent::AgentMessage {
+                                        role: "user",
+                                        text: "Continue".to_owned(),
+                                    },
+                                );
+                                continue;
+                            }
+                            break;
+                        }
+                        send(
                             &event_tx,
-                        )
-                        .await;
-                        let _ = event_tx.send(ChatEvent::Finished {
-                            result: match &result {
-                                Ok(_) => Ok(()),
-                                Err(e) => Err(format!("{e:#}")),
+                            ChatEvent::Finished {
+                                result: Ok(()),
+                                last_message_id: parent_message_id,
                             },
-                            last_message_id: result.ok().flatten(),
-                        });
+                        );
                     }
                     WorkerCommand::LoadHistory { session_id } => {
                         let event = match client.history(&session_id).await {
                             Ok(messages) => {
-                                let last_message_id = messages
-                                    .iter()
-                                    .rev()
-                                    .find_map(|m| m.message_id);
+                                let last_message_id =
+                                    messages.iter().rev().find_map(|m| m.message_id);
                                 ChatEvent::HistoryLoaded {
                                     session_id,
                                     messages: messages
@@ -176,7 +309,6 @@ fn spawn_worker(base_url: String, token: String) -> (Sender<WorkerCommand>, Rece
 
     (cmd_tx, event_rx)
 }
-
 #[allow(clippy::too_many_arguments)]
 async fn try_prompt(
     client: &deepseek::DeepSeekClient,
@@ -185,7 +317,7 @@ async fn try_prompt(
     parent_message_id: Option<i64>,
     options: &deepseek::CompletionOptions,
     event_tx: &Sender<ChatEvent>,
-) -> Result<Option<i64>, anyhow::Error> {
+) -> Result<(String, Option<i64>), anyhow::Error> {
     let resp = client
         .completion(session_id, prompt, parent_message_id, options)
         .await?;
@@ -213,9 +345,8 @@ async fn try_prompt(
         }
     })
     .await?;
-    Ok(last)
+    Ok((acc.answer().text, last))
 }
-
 struct ActiveSession {
     id: Option<String>,
     title: String,
@@ -223,8 +354,37 @@ struct ActiveSession {
     last_message_id: Option<i64>,
     deepthink: bool,
     search: bool,
+    code: bool,
 }
 
+/// Remembered DeepThink/Search/Code toggles per chat id (like the web app,
+/// they are per-chat settings). New chats start from the preset default.
+fn default_toggles(config: &config::Config) -> (bool, bool, bool) {
+    let thinking = config
+        .preset(&config.default_preset)
+        .map(|p| p.thinking_enabled)
+        .unwrap_or(false);
+    (thinking, false, false)
+}
+
+struct FireCodeApp {
+    config: config::Config,
+    config_path: std::path::PathBuf,
+    tokens: BTreeMap<String, TokenStatus>,
+    default_token: Option<String>,
+    sessions: Vec<deepseek::SessionInfo>,
+    active: ActiveSession,
+    toggles: BTreeMap<String, (bool, bool, bool)>,
+    busy: bool,
+    input: String,
+    streaming: Option<StreamingAnswer>,
+    copied_code: Option<(egui::Id, std::time::Instant)>,
+    running_command_index: Option<usize>,
+    preset_ids: Vec<String>,
+    preset_selected: usize,
+    event_rx: Receiver<ChatEvent>,
+    cmd_tx: Option<Sender<WorkerCommand>>,
+}
 fn spans_to_job(
     ui: &mut egui::Ui,
     spans: &[InlineSpan],
@@ -425,34 +585,6 @@ fn code_block_ui(
     ui.add_space(2.0);
 }
 
-/// Remembered DeepThink/Search toggles per chat id (like the web app,
-/// they are per-chat settings). New chats start from the preset default.
-fn default_toggles(config: &config::Config) -> (bool, bool) {
-    let thinking = config
-        .preset(&config.default_preset)
-        .map(|p| p.thinking_enabled)
-        .unwrap_or(false);
-    (thinking, false)
-}
-
-struct FireCodeApp {
-    config: config::Config,
-    config_path: std::path::PathBuf,
-    tokens: BTreeMap<String, TokenStatus>,
-    default_token: Option<String>,
-    sessions: Vec<deepseek::SessionInfo>,
-    active: ActiveSession,
-    toggles: BTreeMap<String, (bool, bool)>,
-    busy: bool,
-    input: String,
-    streaming: Option<StreamingAnswer>,
-    copied_code: Option<(egui::Id, std::time::Instant)>,
-    preset_ids: Vec<String>,
-    preset_selected: usize,
-    event_rx: Receiver<ChatEvent>,
-    cmd_tx: Option<Sender<WorkerCommand>>,
-}
-
 impl FireCodeApp {
     fn new(config: config::Config, config_path: std::path::PathBuf) -> Self {
         let preset_ids: Vec<String> = config.presets.keys().cloned().collect();
@@ -464,6 +596,9 @@ impl FireCodeApp {
             .preset(&config.default_preset)
             .map(|p| p.thinking_enabled)
             .unwrap_or(false);
+        if let Err(e) = agent::ensure_agents_md() {
+            eprintln!("AGENTS.md: {e:#}");
+        }
         let mut app = Self {
             config,
             config_path,
@@ -477,12 +612,14 @@ impl FireCodeApp {
                 last_message_id: None,
                 deepthink: default_deepthink,
                 search: false,
+                code: false,
             },
             toggles: BTreeMap::new(),
             busy: false,
             input: String::new(),
             streaming: None,
             copied_code: None,
+            running_command_index: None,
             preset_ids,
             preset_selected,
             event_rx: std::sync::mpsc::channel().1,
@@ -530,7 +667,11 @@ impl FireCodeApp {
 
         match (&self.default_token, self.config.site(&self.config.default_site)) {
             (Some(token), Ok(site)) => {
-                let (cmd_tx, event_rx) = spawn_worker(site.api_base.clone(), token.clone());
+                let (cmd_tx, event_rx) = spawn_worker(
+                    site.api_base.clone(),
+                    token.clone(),
+                    self.config.agent.clone(),
+                );
                 self.cmd_tx = Some(cmd_tx);
                 self.event_rx = event_rx;
             }
@@ -539,7 +680,7 @@ impl FireCodeApp {
     }
 
     fn refresh_sessions(&mut self) {
-        if let Some(cmd_tx) = &self.cmd_tx {
+        if let Some(cmd_tx) = self.cmd_tx.clone() {
             let _ = cmd_tx.send(WorkerCommand::RefreshSessions);
         }
     }
@@ -548,7 +689,7 @@ impl FireCodeApp {
         if self.busy {
             return;
         }
-        let (deepthink, search) = self
+        let (deepthink, search, code) = self
             .toggles
             .get(&id)
             .copied()
@@ -560,6 +701,7 @@ impl FireCodeApp {
             last_message_id: None,
             deepthink,
             search,
+            code,
         };
         if let Some(cmd_tx) = self.cmd_tx.clone() {
             self.busy = true;
@@ -573,7 +715,7 @@ impl FireCodeApp {
         if self.busy {
             return;
         }
-        let (deepthink, search) = default_toggles(&self.config);
+        let (deepthink, search, code) = default_toggles(&self.config);
         self.active = ActiveSession {
             id: None,
             title: "New chat".to_owned(),
@@ -581,20 +723,24 @@ impl FireCodeApp {
             last_message_id: None,
             deepthink,
             search,
+            code,
         };
         self.streaming = None;
     }
 
     fn toggle_active(&mut self, which: u8) {
-        let (mut deepthink, mut search) = (self.active.deepthink, self.active.search);
+        let (mut deepthink, mut search, mut code) =
+            (self.active.deepthink, self.active.search, self.active.code);
         match which {
             0 => deepthink = !deepthink,
-            _ => search = !search,
+            1 => search = !search,
+            _ => code = !code,
         }
         self.active.deepthink = deepthink;
         self.active.search = search;
+        self.active.code = code;
         if let Some(id) = self.active.id.clone() {
-            self.toggles.insert(id, (deepthink, search));
+            self.toggles.insert(id, (deepthink, search, code));
         }
     }
 
@@ -603,6 +749,30 @@ impl FireCodeApp {
         if text.is_empty() || self.busy {
             return;
         }
+        self.input.clear();
+        self.dispatch_prompt(text, None);
+    }
+
+    fn send_prompt_from_agents_md(&mut self) {
+        if self.busy {
+            return;
+        }
+        let content = match agent::load_agents_md() {
+            Ok(c) => c,
+            Err(e) => {
+                self.messages_push(ChatMessage {
+                    role: "error",
+                    thinking: None,
+                    text: format!("AGENTS.md: {e:#}"),
+                });
+                return;
+            }
+        };
+        let chars = content.chars().count();
+        self.dispatch_prompt(content, Some(format!("(AGENTS.md, {chars} chars)")));
+    }
+
+    fn dispatch_prompt(&mut self, text: String, display_text: Option<String>) {
         let Some(cmd_tx) = self.cmd_tx.clone() else {
             return;
         };
@@ -611,12 +781,12 @@ impl FireCodeApp {
             .preset(self.selected_preset_id())
             .map(|p| p.model_class.clone())
             .unwrap_or_else(|_| "deepseek_chat".to_owned());
+        let display = display_text.clone().unwrap_or_else(|| text.clone());
         self.messages_push(ChatMessage {
-            role: "user",
+            role: if display_text.is_some() { "prompt" } else { "user" },
             thinking: None,
-            text: text.clone(),
+            text: display,
         });
-        self.input.clear();
         self.streaming = Some(StreamingAnswer::default());
         self.busy = true;
         let _ = cmd_tx.send(WorkerCommand::Prompt {
@@ -628,6 +798,7 @@ impl FireCodeApp {
                 thinking_enabled: self.active.deepthink,
                 search_enabled: self.active.search,
             },
+            agent: self.active.code,
         });
     }
 
@@ -647,14 +818,17 @@ impl FireCodeApp {
         while let Ok(event) = self.event_rx.try_recv() {
             repaint = true;
             match event {
+                ChatEvent::StreamStart => {
+                    self.streaming = Some(StreamingAnswer::default());
+                }
                 ChatEvent::Delta(streaming) => {
                     self.streaming = Some(streaming);
                 }
-                ChatEvent::Finished {
+                ChatEvent::ResponseDone {
                     result,
                     last_message_id,
+                    visible_text,
                 } => {
-                    self.busy = false;
                     let streaming = self.streaming.take().unwrap_or_default();
                     match result {
                         Ok(()) => {
@@ -664,7 +838,7 @@ impl FireCodeApp {
                             self.messages_push(ChatMessage {
                                 role: "assistant",
                                 thinking: streaming.thinking,
-                                text: streaming.text,
+                                text: visible_text.unwrap_or(streaming.text),
                             });
                         }
                         Err(e) => {
@@ -682,6 +856,65 @@ impl FireCodeApp {
                             });
                         }
                     }
+                }
+                ChatEvent::Finished {
+                    result,
+                    last_message_id,
+                } => {
+                    self.busy = false;
+                    self.running_command_index = None;
+                    self.streaming = None;
+                    match result {
+                        Ok(()) => {
+                            if let Some(id) = last_message_id {
+                                self.active.last_message_id = Some(id);
+                            }
+                        }
+                        Err(e) => {
+                            self.messages_push(ChatMessage {
+                                role: "error",
+                                thinking: None,
+                                text: e,
+                            });
+                        }
+                    }
+                }
+                ChatEvent::CommandStarted { cmd } => {
+                    self.messages_push(ChatMessage {
+                        role: "command",
+                        thinking: None,
+                        text: format!("$ {cmd}\n...running"),
+                    });
+                    self.running_command_index = Some(self.active.messages.len() - 1);
+                }
+                ChatEvent::CommandFinished { cmd, output } => {
+                    let text = format!(
+                        "$ {cmd}\n{}",
+                        if output.output.trim().is_empty() {
+                            "(no output)".to_owned()
+                        } else {
+                            output.output.trim_end().to_owned()
+                        }
+                    );
+                    if let Some(idx) = self.running_command_index {
+                        if let Some(msg) = self.active.messages.get_mut(idx) {
+                            msg.text = text;
+                            self.running_command_index = None;
+                            continue;
+                        }
+                    }
+                    self.messages_push(ChatMessage {
+                        role: "command",
+                        thinking: None,
+                        text,
+                    });
+                }
+                ChatEvent::AgentMessage { role, text } => {
+                    self.messages_push(ChatMessage {
+                        role,
+                        thinking: None,
+                        text,
+                    });
                 }
                 ChatEvent::SessionCreated { id } => {
                     self.active.id = Some(id.clone());
@@ -731,7 +964,6 @@ impl FireCodeApp {
         }
     }
 }
-
 impl eframe::App for FireCodeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -768,7 +1000,7 @@ impl eframe::App for FireCodeApp {
                                 );
                             }
                         });
-                    egui::CollapsingHeader::new("вљ™ auth")
+                    egui::CollapsingHeader::new("⚙ auth")
                         .id_salt("auth_panel")
                         .show(ui, |ui| {
                             ui.monospace(self.config_path.display().to_string());
@@ -815,7 +1047,7 @@ impl eframe::App for FireCodeApp {
                         if ui.add_enabled(!self.busy, egui::Button::new("+ New chat")).clicked() {
                             self.new_chat();
                         }
-                        if ui.add_enabled(!self.busy, egui::Button::new("вџі")).clicked() {
+                        if ui.add_enabled(!self.busy, egui::Button::new("⟳")).clicked() {
                             self.refresh_sessions();
                         }
                     });
@@ -906,6 +1138,19 @@ impl eframe::App for FireCodeApp {
                     if ui.add_enabled(!self.busy, search_btn).clicked() {
                         self.toggle_active(1);
                     }
+                    let code_btn = egui::Button::selectable(
+                        self.active.code,
+                        egui::RichText::new("<> Code"),
+                    );
+                    if ui.add_enabled(!self.busy, code_btn).clicked() {
+                        self.toggle_active(2);
+                    }
+                    if ui
+                        .add_enabled(!self.busy && self.cmd_tx.is_some(), egui::Button::new("📄 Prompt"))
+                        .clicked()
+                    {
+                        self.send_prompt_from_agents_md();
+                    }
                     if self.busy {
                         ui.spinner();
                     }
@@ -956,6 +1201,33 @@ impl eframe::App for FireCodeApp {
                                         format!("blocks{mi}").as_str(),
                                         &mut self.copied_code,
                                     );
+                                }
+                                "command" => {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.strong("⚙");
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&message.text).monospace(),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Extend),
+                                        );
+                                    });
+                                }
+                                "feedback" => {
+                                    ui.strong("⚙ Feedback:");
+                                    markdown_blocks_ui(
+                                        ui,
+                                        &ctx2,
+                                        &message.text,
+                                        format!("feedback{mi}").as_str(),
+                                        &mut self.copied_code,
+                                    );
+                                }
+                                "prompt" => {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.strong("📄 Prompt:");
+                                        ui.label(&message.text);
+                                    });
                                 }
                                 _ => {
                                     ui.colored_label(
