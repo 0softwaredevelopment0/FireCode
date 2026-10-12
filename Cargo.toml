@@ -1,7 +1,10 @@
-[package]
+﻿[package]
 name = "firecode"
 version = "0.2.1-beta.1"
 edition = "2024"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 aes-gcm = "0.11.1"

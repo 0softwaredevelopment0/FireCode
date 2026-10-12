@@ -1773,10 +1773,16 @@ fn main() -> eframe::Result {
     let (config, config_path) =
         config::load_or_create().unwrap_or_else(|e| panic!("config error: {e:#}"));
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("FireCode")
+        .with_inner_size([1000.0, 650.0]);
+    if let Ok(icon) =
+        eframe::icon_data::from_png_bytes(include_bytes!("../resources/app-icon.png").as_slice())
+    {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("FireCode")
-            .with_inner_size([1000.0, 650.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
