@@ -8,10 +8,12 @@ const MAX_OUTPUT_CHARS: usize = 32_000;
 
 #[derive(Debug, Clone)]
 pub struct ParsedResponse {
-    /// Visible message text with command/continue lines removed.
+    /// Visible message text with command/stop lines removed.
     pub text: String,
     pub commands: Vec<String>,
-    pub continue_next: bool,
+    /// `<stop>` seen on its own line (outside fences): the agent ended the
+    /// turn. Without it FireCode keeps sending automatic "Continue" prompts.
+    pub stop: bool,
 }
 
 /// Unescapes a double-quoted command string: `\"` → `"`, `\\` → `\`,
@@ -43,14 +45,14 @@ fn unescape_command_string(raw: &str) -> String {
 
 /// Extracts single-line `<command:"...">` commands, multiline
 /// `<command-header>` / `<string:"...">` (or `<string:'...'>`) /
-/// `<command-footer>` blocks and a trailing `<continue>` marker from a
+/// `<command-footer>` blocks and the `<stop>` end-of-turn marker from a
 /// response. Anything else stays in `text`. A multiline block runs as one
 /// command (lines joined with `\n`). Lines inside ``` fenced code blocks
 /// are never treated as commands or markers - fences shield documentation.
 pub fn parse_response(raw: &str) -> ParsedResponse {
     let mut text = String::new();
     let mut commands = Vec::new();
-    let mut continue_next = false;
+    let mut stop = false;
     let mut multi: Option<Vec<String>> = None;
     let mut in_fence = false;
 
@@ -109,8 +111,8 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
             commands.push(cmd);
             continue;
         }
-        if trimmed == "<continue>" {
-            continue_next = true;
+        if trimmed == "<stop>" {
+            stop = true;
             continue;
         }
         text.push_str(line);
@@ -122,7 +124,7 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
     ParsedResponse {
         text: text.trim_end().to_owned(),
         commands,
-        continue_next,
+        stop,
     }
 }
 
@@ -424,9 +426,9 @@ Rules:
   anything interactive - there is no screen to show them on.
 - After all commands finish you receive their results as a feedback message:
   `Command "cmd":` followed by the captured output (long output is
-  truncated). That feedback triggers you again automatically, so you do NOT
-  need `<continue>` alongside commands - if a message has both, the commands
-  run and the `<continue>` is simply ignored.
+  truncated). That feedback triggers you again automatically, so you do not
+  need anything else alongside commands - and a `<stop>` in a message with
+  commands is only honored after the command feedback arrives.
 - Keep the number of commands small and purposeful. Do not run destructive
   commands (deleting files, force pushes) unless the user explicitly asked.
 
@@ -465,22 +467,27 @@ files; leading spaces are preserved exactly. Lines inside ``` fenced code
 blocks are never treated as commands or markers - use fences when showing
 syntax examples.
 
-## Tool 2: continue
+## Tool 2: stopping the turn
 
-Every user request is just an information output task, and one response may
-not fit everything: if you have NOT finished what the user asked for - you
-stopped mid-sentence, still owe part of the answer, or the task needs more
-steps - end your message with a single line:
+FireCode runs a conversation loop: after every response of yours that does
+not contain commands it automatically sends you this prompt:
 
-<continue>
+Continue, to stop this response, use <stop> in your message on new line.
 
-FireCode will automatically send you "Continue" so you can pick up where you
-stopped. Use `<continue>` whenever your answer is incomplete, not only when
-you visibly "stopped on something".
+To END the agent turn - the task is fully done and there is nothing left to
+add - put this marker on its own line, anywhere in your message:
+
+<stop>
+
+While your message has no `<stop>`, FireCode keeps nudging you with
+"Continue" forever - so ALWAYS finish your final answer with `<stop>`. If
+the task is not finished yet, just keep working (answer further or issue
+more commands) and do not write `<stop>`.
 
 ## General
 
-- Plain text without commands or `<continue>` ends the agent turn.
+- A message with neither commands nor `<stop>` receives an automatic
+  "Continue" prompt - end your turn with `<stop>` on its own line.
 - Write commands exactly in the syntax shown - they are parsed line-by-line.
 "#;
 
@@ -520,11 +527,67 @@ pub fn ensure_prompt_md() -> Result<PathBuf> {
         updated.push_str(&fences_docs_section());
         changed = true;
     }
+    // `<continue>` was replaced by the auto-continue loop with `<stop>`:
+    // swap the old section (and the General bullet that mentions it) for
+    // the new stop docs
+    if updated.contains("<continue>") {
+        updated = replace_continue_docs(&updated);
+        changed = true;
+    }
     if changed {
         std::fs::write(&path, updated)
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(path)
+}
+
+/// Replaces the old `<continue>` docs with the `<stop>` docs. Surgical
+/// when the standard headings are present (cut from "## Tool 2: continue"
+/// to the next "## " heading, swap the General bullet), otherwise the new
+/// section is appended so the rule exists no matter how the file was
+/// edited.
+fn replace_continue_docs(raw: &str) -> String {
+    let mut updated = raw.to_owned();
+    let heading = "## Tool 2: continue";
+    if let Some(start) = updated.find(heading) {
+        let after = start + heading.len();
+        let end = updated[after..]
+            .find("\n## ")
+            .map(|i| after + i + 1)
+            .unwrap_or(updated.len());
+        updated.replace_range(start..end, stop_docs_section().trim_end());
+    } else {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(stop_docs_section());
+    }
+    updated = updated.replace(
+        "- Plain text without commands or `<continue>` ends the agent turn.",
+        "- A message with neither commands nor `<stop>` receives an automatic\n  \"Continue\" prompt - end your turn with `<stop>` on its own line.",
+    );
+    updated
+}
+
+fn stop_docs_section() -> &'static str {
+    r#"
+## Tool 2: stopping the turn
+
+FireCode runs a conversation loop: after every response of yours that does
+not contain commands it automatically sends you this prompt:
+
+Continue, to stop this response, use <stop> in your message on new line.
+
+To END the agent turn - the task is fully done and there is nothing left to
+add - put this marker on its own line, anywhere in your message:
+
+<stop>
+
+While your message has no `<stop>`, FireCode keeps nudging you with
+"Continue" forever - so ALWAYS finish your final answer with `<stop>`. If
+the task is not finished yet, just keep working (answer further or issue
+more commands) and do not write `<stop>`.
+"#
 }
 
 fn multiline_tool_section() -> &'static str {
@@ -589,25 +652,39 @@ mod tests {
             parsed.commands,
             vec!["git status".to_owned(), "cargo build --release".to_owned()]
         );
-        assert!(!parsed.continue_next);
+        assert!(!parsed.stop);
         assert!(parsed.text.contains("Привет"));
         assert!(parsed.text.contains("готово"));
         assert!(!parsed.text.contains("<command"));
     }
 
     #[test]
-    fn parse_continue_marker() {
-        let parsed = parse_response("часть ответа\n<continue>");
-        assert!(parsed.continue_next);
+    fn parse_stop_marker() {
+        let parsed = parse_response("часть ответа\n<stop>");
+        assert!(parsed.stop);
         assert!(parsed.commands.is_empty());
         assert_eq!(parsed.text, "часть ответа");
+    }
+
+    #[test]
+    fn parse_stop_marker_anywhere_and_indented() {
+        let parsed = parse_response("  <stop>  \nсередина\n<stop>");
+        assert!(parsed.stop);
+        assert_eq!(parsed.text, "середина");
+    }
+
+    #[test]
+    fn parse_stop_lookalikes_stay_text() {
+        let parsed = parse_response("<stop >\n<stopx>\nthe stop\nstop");
+        assert!(!parsed.stop);
+        assert!(parsed.text.contains("<stop >"));
     }
 
     #[test]
     fn parse_plain_text() {
         let parsed = parse_response("just an answer\nsecond line");
         assert!(parsed.commands.is_empty());
-        assert!(!parsed.continue_next);
+        assert!(!parsed.stop);
         assert_eq!(parsed.text, "just an answer\nsecond line");
     }
 
@@ -775,12 +852,12 @@ mod tests {
 
     #[test]
     fn parse_fenced_markers_stay_text() {
-        let raw = "text\n```\n<command:\"x\">\n<continue>\n```\nafter";
+        let raw = "text\n```\n<command:\"x\">\n<stop>\n```\nafter";
         let parsed = parse_response(raw);
         assert!(parsed.commands.is_empty());
-        assert!(!parsed.continue_next);
+        assert!(!parsed.stop);
         assert!(parsed.text.contains("<command:\"x\">"));
-        assert!(parsed.text.contains("<continue>"));
+        assert!(parsed.text.contains("<stop>"));
     }
 
     #[test]
@@ -798,16 +875,16 @@ mod tests {
         let raw = "делаю\n<command-header>\n<string:\"cd project\">\n<string:\"cargo build\">\n<string:\"cargo test\">\n<command-footer>\nготово";
         let parsed = parse_response(raw);
         assert_eq!(parsed.commands, vec!["cd project\ncargo build\ncargo test".to_owned()]);
-        assert!(!parsed.continue_next);
+        assert!(!parsed.stop);
         assert_eq!(parsed.text, "делаю\nготово");
     }
 
     #[test]
-    fn parse_multiline_mixed_with_single_and_continue() {
-        let raw = "<command:\"git status\">\n<command-header>\n<string:\"echo a\">\n<command-footer>\n<continue>";
+    fn parse_multiline_mixed_with_single_and_stop() {
+        let raw = "<command:\"git status\">\n<command-header>\n<string:\"echo a\">\n<command-footer>\n<stop>";
         let parsed = parse_response(raw);
         assert_eq!(parsed.commands, vec!["git status".to_owned(), "echo a".to_owned()]);
-        assert!(parsed.continue_next);
+        assert!(parsed.stop);
         assert!(parsed.text.is_empty());
     }
 
@@ -826,10 +903,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_commands_and_continue_together() {
-        let parsed = parse_response("<command:\"git status\">\ntext\n<continue>");
+    fn parse_commands_and_stop_together() {
+        let parsed = parse_response("<command:\"git status\">\ntext\n<stop>");
         assert_eq!(parsed.commands, vec!["git status".to_owned()]);
-        assert!(parsed.continue_next);
+        assert!(parsed.stop);
         assert_eq!(parsed.text, "text");
     }
 

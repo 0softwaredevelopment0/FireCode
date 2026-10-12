@@ -11,7 +11,7 @@ Current version: 0.2.1-beta.1.
 
 - 💬 **DeepSeek chat** — streaming responses (SSE), thinking mode, search, model preset selection.
 - 🤖 **Agent mode** — the model proposes commands in the `<command:"...">` format, FireCode runs them and feeds the output back into the chat as feedback.
-- 🔁 **Answer continuation** — a `<continue>` marker makes the client automatically request continuation until the task is done.
+- 🔁 **Auto-continue loop** — after every reply FireCode automatically prompts the model with *"Continue, to stop this response, use \<stop\> in your message on new line."* The loop only stops when the model writes `<stop>` on a new line anywhere in its message.
 - 🔐 **Token reading from the browser** — Firefox (localStorage/SQLite), Chrome and Yandex (DPAPI + AES-256-GCM for cookies, LevelDB for localStorage).
 - 🖥️ **egui/eframe GUI** — lightweight native interface, targeting Windows.
 - 📝 **Markdown rendering** — code, lists, tables, emphasis.
@@ -41,7 +41,8 @@ The resulting binary is `target/release/firecode.exe`.
 2. In Settings, pick the browser to take the token from and, if needed, the profile path.
 3. The app reads the DeepSeek token from the browser profile.
 4. Type a request. In agent mode the model may reply with lines like `<command:"git status">` — FireCode executes them and feeds the output back into the chat.
-5. If a reply gets cut off but the task is not finished, the model ends the message with a `<continue>` line — the client automatically continues.
+5. Type a request. In agent mode the model may reply with lines like `<command:"git status">` — FireCode executes them and feeds the output back into the chat.
+6. The agent loop keeps going: after every reply FireCode sends the *"Continue, to stop this response..."* prompt automatically. The model ends its final message with a `<stop>` line to close the turn — no continue marker needs to be remembered.
 
 ### Working files next to the exe
 

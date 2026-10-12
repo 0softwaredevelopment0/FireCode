@@ -230,8 +230,9 @@ fn spawn_worker(
                             }
 
                             let parsed = parsed.expect("parsed in agent mode");
-                            // Commands and <continue> may share a message: commands win,
-                            // their feedback output re-triggers the agent on its own.
+                            // Commands share the message with the loop
+                            // markers: they run first and their feedback
+                            // output re-triggers the agent on its own.
                             if !parsed.commands.is_empty() {
                                 let mut results = Vec::new();
                                 for cmd in &parsed.commands {
@@ -267,18 +268,23 @@ fn spawn_worker(
                                 );
                                 continue;
                             }
-                            if parsed.continue_next {
-                                next_text = "Continue".to_owned();
-                                send(
-                                    &event_tx,
-                                    ChatEvent::AgentMessage {
-                                        role: "user",
-                                        text: "Continue".to_owned(),
-                                    },
-                                );
-                                continue;
+                            // the auto-continue loop: until the model writes
+                            // <stop> on its own line, nudge it with the
+                            // standard Continue prompt after every reply
+                            if parsed.stop {
+                                break;
                             }
-                            break;
+                            next_text =
+                                "Continue, to stop this response, use <stop> in your message on new line."
+                                    .to_owned();
+                            send(
+                                &event_tx,
+                                ChatEvent::AgentMessage {
+                                    role: "user",
+                                    text: next_text.clone(),
+                                },
+                            );
+                            continue;
                         }
                         send(
                             &event_tx,
