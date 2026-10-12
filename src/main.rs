@@ -192,8 +192,8 @@ fn spawn_worker(
                                 &stop_rx,
                             )
                             .await;
-                            let (full_text, last_id) = match result {
-                                Ok((text, id)) => (text, id),
+                            let (full_text, last_id, manually_stopped) = match result {
+                                Ok((text, id, stopped)) => (text, id, stopped),
                                 Err(e) => {
                                     send(
                                         &event_tx,
@@ -226,6 +226,13 @@ fn spawn_worker(
                             );
 
                             if !agent {
+                                break;
+                            }
+
+                            // a manual Stop must end the whole turn: the
+                            // partial reply is kept as-is, no commands run
+                            // and no auto-continue prompt goes out
+                            if manually_stopped {
                                 break;
                             }
 
@@ -344,7 +351,7 @@ async fn try_prompt(
     options: &deepseek::CompletionOptions,
     event_tx: &Sender<ChatEvent>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
-) -> Result<(String, Option<i64>), anyhow::Error> {
+) -> Result<(String, Option<i64>, bool), anyhow::Error> {
     // drop stop signals from previous phases - only a stop pressed during
     // this stream cancels it
     while stop_rx.try_recv().is_ok() {}
@@ -398,7 +405,9 @@ async fn try_prompt(
             let _ = client.stop_stream(session_id, id).await;
         }
     }
-    Ok((acc.answer().text, last))
+    // the third value tells the agent loop that the user stopped the stream
+    // manually - the partial text must not trigger the auto-continue loop
+    Ok((acc.answer().text, last, stop_requested))
 }
 struct ActiveSession {
     id: Option<String>,
