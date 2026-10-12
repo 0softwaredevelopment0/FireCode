@@ -1,6 +1,6 @@
 ﻿# FireCode
 
-**FireCode** is a desktop client that turns AI chat websites (DeepSeek) into a full-blown
+**FireCode** is a desktop client that turns AI chat websites (e.g. DeepSeek) into a full-blown
 coding agent. The app reads the authentication token straight from the local browser
 profile (Firefox / Chrome / Yandex), talks to the DeepSeek API and executes commands
 in the PC terminal, feeding their output back into the conversation.
