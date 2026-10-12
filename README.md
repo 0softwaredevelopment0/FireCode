@@ -1,30 +1,31 @@
 ﻿# FireCode
 
-**FireCode** — десктопный клиент, превращающий сайты AI-чата (DeepSeek) в полноценного
-кодирующего агента. Приложение читает токен аутентификации прямо из локального профиля
-браузера (Firefox / Chrome / Yandex), общается с API DeepSeek и выполняет команды
-в терминале на ПК, возвращая их вывод обратно в диалог.
+**FireCode** is a desktop client that turns AI chat websites (DeepSeek) into a full-blown
+coding agent. The app reads the authentication token straight from the local browser
+profile (Firefox / Chrome / Yandex), talks to the DeepSeek API and executes commands
+in the PC terminal, feeding their output back into the conversation.
 
-Текущая версия: 0.2.1-beta.1.
+Current version: 0.2.1-beta.1.
 
-## Возможности
+## Features
 
-- 💬 **Чат с DeepSeek** — потоковые ответы (SSE), thinking-режим, поиск, выбор пресета модели.
-- 🤖 **Агентный режим** — модель предлагает команды в формате <command:"...">, FireCode выполняет их и возвращает вывод в чат как обратную связь.
-- 🔁 **Продолжение ответа** — маркер <continue> заставляет клиента автоматически запросить продолжение, пока задача не завершена.
-- 🔐 **Чтение токена из браузера** — Firefox (localStorage/SQLite), Chrome и Yandex (DPAPI + AES-256-GCM для куки, LevelDB для localStorage).
-- 🖥️ **GUI на egui/eframe** — кроссплатформенный интерфейс, целевая платформа Windows.
-- 📝 **Markdown-рендеринг** — код, списки, таблицы, выделение.
-- 📎 **AGENTS.md / PROMPT.md** — пользовательские инструкции агенту рядом с exe; AGENTS.md может добавляться к каждому сообщению.
-- 📦 **Портативность** — настройки и конфиг хранятся в %APPDATA%\0softwaredevelopment0\FireCode.
+- 💬 **DeepSeek chat** — streaming responses (SSE), thinking mode, search, model preset selection.
+- 🤖 **Agent mode** — the model proposes commands in the `<command:"...">` format, FireCode runs them and feeds the output back into the chat as feedback.
+- 🔁 **Answer continuation** — a `<continue>` marker makes the client automatically request continuation until the task is done.
+- 🔐 **Token reading from the browser** — Firefox (localStorage/SQLite), Chrome and Yandex (DPAPI + AES-256-GCM for cookies, LevelDB for localStorage).
+- 🖥️ **egui/eframe GUI** — lightweight native interface, targeting Windows.
+- 📝 **Markdown rendering** — code, lists, tables, emphasis.
+- 💾 **Local chat cache** — every chat (including command/feedback windows) is cached per session, so reopening a chat — even after an app restart — looks exactly like before.
+- 📎 **AGENTS.md / PROMPT.md** — custom agent instructions next to the exe; AGENTS.md can be prepended to every message.
+- 📦 **Portability** — settings and config live in `%APPDATA%\0softwaredevelopment0\FireCode`.
 
-## Требования
+## Requirements
 
-- **Windows 10/11** (основная платформа).
-- **Rust** (edition 2024) и Cargo — для сборки из исходников.
-- Браузер (Firefox, Chrome или Yandex) с активной сессией на chat.deepseek.com.
+- **Windows 10/11** (primary platform).
+- **Rust** (edition 2024) and Cargo — to build from source.
+- A browser (Firefox, Chrome or Yandex) with an active session on chat.deepseek.com.
 
-## Сборка
+## Building
 
 ```bash
 git clone https://github.com/0softwaredevelopment0/FireCode.git
@@ -32,70 +33,69 @@ cd FireCode
 cargo build --release
 ```
 
-Готовый бинарник: target/release/firecode.exe.
+The resulting binary is `target/release/firecode.exe`.
 
-## Использование
+## Usage
 
-1. Запустите firecode.exe.
-2. В настройках выберите браузер-источник токена и, при необходимости, путь к профилю.
-3. Приложение прочитает токен DeepSeek из профиля браузера.
-4. Введите запрос. В агентном режиме модель может возвращать строки вида <command:"git status"> — FireCode выполнит их и вернёт вывод в чат.
-5. Если ответ обрывается, но задача не закончена, модель завершает сообщение строкой <continue> — клиент автоматически продолжит.
+1. Run `firecode.exe`.
+2. In Settings, pick the browser to take the token from and, if needed, the profile path.
+3. The app reads the DeepSeek token from the browser profile.
+4. Type a request. In agent mode the model may reply with lines like `<command:"git status">` — FireCode executes them and feeds the output back into the chat.
+5. If a reply gets cut off but the task is not finished, the model ends the message with a `<continue>` line — the client automatically continues.
 
-### Рабочие файлы рядом с exe
+### Working files next to the exe
 
-| Файл | Назначение |
-|------|------------|
-| PROMPT.md | Инструкции агента (создаётся автоматически, можно править). Кнопка отправляет его содержимое как запрос. |
-| AGENTS.md | Пользовательские инструкции проекта. При включённой опции Include AGENTS.md добавляются к каждому сообщению. |
+| File | Purpose |
+|------|---------|
+| PROMPT.md | Agent instructions (created automatically, editable). The 📄 Prompt button sends its content as a request. |
+| AGENTS.md | Custom project instructions. When the Include AGENTS.md option is on, they are prepended to every message. |
 
-### Конфигурация
+### Configuration
 
-- %APPDATA%\0softwaredevelopment0\FireCode\config.toml — сайты, пресеты, параметры агента.
-- %APPDATA%\0softwaredevelopment0\FireCode\settings.toml — выбранный браузер и опции агента.
+- `%APPDATA%\0softwaredevelopment0\FireCode\config.toml` — sites, presets, agent parameters.
+- `%APPDATA%\0softwaredevelopment0\FireCode\settings.toml` — selected browser and agent options.
+- `%APPDATA%\0softwaredevelopment0\FireCode\chat-cache\` — per-session chat cache (JSON).
 
-Основные параметры агента (config.toml):
+Agent parameters (config.toml):
 
-| Параметр | Описание | По умолчанию |
-|----------|----------|--------------|
-| agent.shell | Оболочка: powershell или cmd | powershell |
-| agent.working_dir | Рабочая директория команд (пусто = папка с exe) | папка exe |
-| agent.timeout_secs | Таймаут одной команды, сек | 300 |
-| agent.max_steps | Максимум шагов агента | 25 |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| agent.shell | Shell: powershell or cmd | powershell |
+| agent.timeout_secs | Per-command timeout, seconds | 300 |
+| agent.max_steps | Maximum agent steps | 25 |
 
-Настройки (settings.toml):
+Settings (settings.toml):
 
-| Параметр | Описание | По умолчанию |
-|----------|----------|--------------|
-| browser.preset | Источник токена: firefox, chrome, yandex | firefox |
-| agent.allow_sudo | Разрешить команды, начинающиеся с sudo | false |
-| agent.include_agents_md | Добавлять AGENTS.md к каждому сообщению | false |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| browser.preset | Token source: firefox, chrome, yandex | firefox |
+| agent.allow_sudo | Allow commands starting with sudo | false |
+| agent.include_agents_md | Prepend AGENTS.md to every message | false |
+| agent.working_dir | Working directory for commands (`local` = exe folder) | local |
 
-## Архитектура
+## Architecture
 
-| Файл | Роль |
+| File | Role |
 |------|------|
-| src/main.rs | Точка входа, GUI (egui), воркер чата, обработка событий. |
-| src/agent.rs | Парсинг <command> / <continue>, запуск команд в свежей оболочке, формирование обратной связи. |
-| src/deepseek.rs | HTTP-клиент DeepSeek (SSE-стриминг, POW-челлендж, сессии, завершения). |
-| src/pow.rs | Решение proof-of-work челленджа DeepSeek. |
-| src/auth.rs | Извлечение токена: Firefox localStorage, разворачивание обёрток значений. |
-| src/chromium.rs | Chrome/Yandex: чтение LevelDB localStorage, DPAPI, AES-256-GCM куки. |
-| src/config.rs | config.toml: сайты, пресеты, параметры агента, поиск профиля Firefox. |
-| src/settings.rs | settings.toml: пресет браузера и опции агента. |
-| src/markdown.rs | Минимальный Markdown-парсер для отображения. |
-| src/fonts.rs | Загрузка шрифтов для GUI. |
+| src/main.rs | Entry point, GUI (egui), chat worker, event handling. |
+| src/agent.rs | Parsing `<command>` / `<continue>`, running commands in a fresh shell, building feedback. |
+| src/chatcache.rs | Per-session local chat cache (JSON). |
+| src/deepseek.rs | DeepSeek HTTP client (SSE streaming, POW challenge, sessions, completions). |
+| src/pow.rs | Solving the DeepSeek proof-of-work challenge. |
+| src/auth.rs | Token extraction: Firefox localStorage, unwrapping value wrappers. |
+| src/chromium.rs | Chrome/Yandex: LevelDB localStorage, DPAPI, AES-256-GCM cookies. |
+| src/config.rs | config.toml: sites, presets, agent parameters, Firefox profile discovery. |
+| src/settings.rs | settings.toml: browser preset and agent options. |
+| src/markdown.rs | Minimal Markdown parser for rendering. |
+| src/fonts.rs | Font loading for the GUI. |
 
-## Особенности выполнения команд
+## Command execution details
 
-- Каждая команда запускается в свежей оболочке (cd не сохраняется между командами — объединяйте шаги в одной строке).
-- Команды выполняются полностью в фоне (CREATE_NO_WINDOW), окно терминала не открывается.
-- Вывод обрезается до 32 000 символов и передаётся модели в формате Command "<cmd>": с кодом выхода.
-- Команды с префиксом sudo блокируются, если не включена опция agent.allow_sudo.
+- Every command runs in a fresh shell (`cd` does not persist between commands — combine steps on one line).
+- Commands run fully in the background (CREATE_NO_WINDOW), no terminal window pops up.
+- Output is truncated to 32,000 characters and fed back to the model as `Command "<cmd>":` blocks with the exit code.
+- Commands with the `sudo` prefix are blocked unless the agent.allow_sudo option is on.
 
-## Лицензия
+## License
 
-GNU Affero General Public License v3.0 (AGPL-3.0). См. LICENSE.
-
-
-
+GNU Affero General Public License v3.0 (AGPL-3.0). See LICENSE.
