@@ -64,10 +64,26 @@ pub struct AgentSettings {
     /// the app was launched from; anything else is a custom path.
     #[serde(default = "default_working_dir")]
     pub working_dir: String,
+    /// Wait before each automatic agent-loop request (command feedback,
+    /// Continue prompt) so rapid back-to-back calls do not hit the
+    /// rate limit. On by default.
+    #[serde(default = "default_true")]
+    pub response_delay_enabled: bool,
+    /// Response delay length in seconds.
+    #[serde(default = "default_response_delay_secs")]
+    pub response_delay_secs: u64,
 }
 
 fn default_working_dir() -> String {
     "local".to_owned()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_response_delay_secs() -> u64 {
+    2
 }
 
 impl Default for AgentSettings {
@@ -76,6 +92,8 @@ impl Default for AgentSettings {
             allow_sudo: false,
             include_agents_md: false,
             working_dir: default_working_dir(),
+            response_delay_enabled: true,
+            response_delay_secs: default_response_delay_secs(),
         }
     }
 }
@@ -135,6 +153,9 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.browser.preset, BrowserPreset::Firefox);
         assert!(!settings.agent.allow_sudo);
+        // the response delay is on by default, two seconds
+        assert!(settings.agent.response_delay_enabled);
+        assert_eq!(settings.agent.response_delay_secs, 2);
     }
 
     #[test]
@@ -150,6 +171,8 @@ mod tests {
                 allow_sudo: true,
                 include_agents_md: true,
                 working_dir: "C:\\work".to_owned(),
+                response_delay_enabled: false,
+                response_delay_secs: 5,
             },
             browser: BrowserSettings {
                 preset: BrowserPreset::Chrome,
@@ -160,6 +183,8 @@ mod tests {
         assert!(parsed.agent.allow_sudo);
         assert!(parsed.agent.include_agents_md);
         assert_eq!(parsed.agent.working_dir, "C:\\work");
+        assert!(!parsed.agent.response_delay_enabled);
+        assert_eq!(parsed.agent.response_delay_secs, 5);
         assert_eq!(parsed.browser.preset, BrowserPreset::Chrome);
     }
 
@@ -168,6 +193,9 @@ mod tests {
         let parsed: Settings = toml::from_str("[agent]\n").expect("parse");
         assert!(!parsed.agent.allow_sudo);
         assert_eq!(parsed.browser.preset, BrowserPreset::Firefox);
+        // old settings.toml files without the delay keys get the defaults
+        assert!(parsed.agent.response_delay_enabled);
+        assert_eq!(parsed.agent.response_delay_secs, 2);
     }
 
     #[test]

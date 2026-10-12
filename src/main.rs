@@ -32,6 +32,8 @@ enum WorkerCommand {
         options: deepseek::CompletionOptions,
         agent: bool,
         allow_sudo: bool,
+        response_delay_enabled: bool,
+        response_delay_secs: u64,
     },
     LoadHistory {
         session_id: String,
@@ -136,10 +138,15 @@ fn spawn_worker(
                         options,
                         agent,
                         allow_sudo,
+                        response_delay_enabled,
+                        response_delay_secs,
                     } => {
                         let mut session_id = session_id;
                         let mut parent_message_id = parent_message_id;
                         let mut next_text = text;
+                        // armed before the loop's automatic sends: the next
+                        // request waits out the rate-limit guard delay
+                        let mut delay_next = false;
 
                         // the agent loop: response -> commands -> feedback -> response
                         let mut step = 0u32;
@@ -159,6 +166,28 @@ fn spawn_worker(
                                     },
                                 );
                                 break;
+                            }
+
+                            // rate-limit guard: pause before each automatic
+                            // request (feedback / Continue), never before the
+                            // user's own first prompt; the flag stays armed
+                            // so every subsequent automatic request waits too
+                            if delay_next && response_delay_enabled && response_delay_secs > 0 {
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    response_delay_secs,
+                                ))
+                                .await;
+                                // a Stop pressed during the delay ends the turn
+                                if stop_rx.try_recv().is_ok() {
+                                    send(
+                                        &event_tx,
+                                        ChatEvent::Finished {
+                                            result: Ok(()),
+                                            last_message_id: parent_message_id,
+                                        },
+                                    );
+                                    break;
+                                }
                             }
 
                             if session_id.is_none() {
@@ -273,6 +302,7 @@ fn spawn_worker(
                                         text: next_text.clone(),
                                     },
                                 );
+                                delay_next = true;
                                 continue;
                             }
                             // the auto-continue loop: until the model writes
@@ -291,6 +321,7 @@ fn spawn_worker(
                                     text: next_text.clone(),
                                 },
                             );
+                            delay_next = true;
                             continue;
                         }
                         send(
@@ -1080,6 +1111,8 @@ impl FireCodeApp {
             },
             agent: self.active.code,
             allow_sudo: self.settings.agent.allow_sudo,
+            response_delay_enabled: self.settings.agent.response_delay_enabled,
+            response_delay_secs: self.settings.agent.response_delay_secs,
         });
     }
 
@@ -1512,6 +1545,23 @@ impl eframe::App for FireCodeApp {
                             );
                         });
                         ui.weak("\"local\" = the folder the app was launched from; anything else is used as a custom path.");
+                        ui.add_space(6.0);
+                        ui.checkbox(
+                            &mut self.settings_draft.agent.response_delay_enabled,
+                            "Response delay (rate-limit guard)",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Delay before automatic agent requests:");
+                            ui.add_enabled(
+                                self.settings_draft.agent.response_delay_enabled,
+                                egui::DragValue::new(
+                                    &mut self.settings_draft.agent.response_delay_secs,
+                                )
+                                .range(0..=600)
+                                .suffix(" s"),
+                            );
+                        });
+                        ui.weak("Before each automatic agent-loop message (command feedback, Continue prompt) FireCode waits this many seconds. The user's own prompt is never delayed.");
                         ui.add_space(6.0);
                         ui.separator();
                         ui.strong("Browser (token source)");
