@@ -9,15 +9,15 @@ Current version: 0.2.1-beta.1.
 
 ## Features
 
-- 💬 **DeepSeek chat** — streaming responses (SSE), thinking mode, search, model preset selection.
-- 🤖 **Agent mode** — the model proposes commands in the `<command:"...">` format, FireCode runs them and feeds the output back into the chat as feedback.
-- 🔁 **Auto-continue loop** — after every reply FireCode automatically prompts the model with *"Continue, to stop this response, use \<stop\> in your message on new line."* The loop only stops when the model writes `<stop>` on a new line anywhere in its message.
-- 🔐 **Token reading from the browser** — Firefox (localStorage/SQLite), Chrome and Yandex (DPAPI + AES-256-GCM for cookies, LevelDB for localStorage).
-- 🖥️ **egui/eframe GUI** — lightweight native interface, targeting Windows.
-- 📝 **Markdown rendering** — code, lists, tables, emphasis.
-- 💾 **Local chat cache** — every chat (including command/feedback windows) is cached per session, so reopening a chat — even after an app restart — looks exactly like before.
-- 📎 **AGENTS.md / PROMPT.md** — custom agent instructions next to the exe; AGENTS.md can be prepended to every message.
-- 📦 **Portability** — settings and config live in `%APPDATA%\0softwaredevelopment0\FireCode`.
+- **Live chat** — streaming responses (SSE), thinking mode, search, model preset selection.
+- **Agent mode** — the model proposes commands in the `<command:"...">` format, FireCode runs them and feeds the output back into the chat as feedback.
+- **Auto-continue loop** — after every reply FireCode automatically prompts the model with *"Continue, to stop this response, use \<stop\> in your message on new line."* The loop only stops when the model writes `<stop>` on a new line anywhere in its message.
+- **Token reading from the browser** — Firefox (localStorage/SQLite), Chrome and Yandex (DPAPI + AES-256-GCM for cookies, LevelDB for localStorage).
+- **egui/eframe GUI** — lightweight native interface, targeting Windows.
+- **Markdown rendering** — code, lists, tables, emphasis.
+- **Local chat cache** — every chat (including command/feedback windows) is cached per session, so reopening a chat — even after an app restart — looks exactly like before.
+- **AGENTS.md / PROMPT.md** — custom agent instructions next to the exe; AGENTS.md can be prepended to every message.
+- **Portability** — settings and config live in `%APPDATA%\0softwaredevelopment0\FireCode`.
 
 ## Requirements
 
