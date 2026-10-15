@@ -1,4 +1,4 @@
-﻿# FireCode
+# FireCode
 
 **FireCode** is a desktop client that turns AI chat websites (e.g. DeepSeek) into a full-blown
 coding agent. The app reads the authentication token straight from the local browser
@@ -99,4 +99,4 @@ Settings (settings.toml):
 
 ## License
 
-GNU Affero General Public License v3.0 (AGPL-3.0). See LICENSE.
+GNU Affero General Public License v3.0 (AGPL-3.0). See LICENSE.md.
